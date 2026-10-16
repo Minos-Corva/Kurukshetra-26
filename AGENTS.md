@@ -20,7 +20,7 @@ A missing signal means **“not demonstrated in the analyzed repository”**, no
 - The backend is a Node.js package using ES modules (`"type": "module"`).
 - Backend entry point: `backend/src/index.js` (currently empty).
 - Backend layer directories exist but are empty: `backend/src/controllers/`, `backend/src/repositories/`, and `backend/src/services/`.
-- Installed backend dependencies: `express`, `@supabase/supabase-js`, `zod`, `dotenv`, `octokit`, and `@huggingface/transformers`.
+- Installed backend dependencies: `express`, `@supabase/supabase-js`, `zod`, `dotenv`, `octokit`, `@huggingface/transformers`, `groq-sdk`, and `openai`. Groq is wired up in `index.js` (exported as `groq`); `openai` is installed but unused.
 - `backend/node_modules/` is installed and ignored by Git. The only known `.gitignore` entry is `/node_modules`.
 - `backend/opencode.json` registers a **read-only Supabase MCP server** for database and documentation features (`project_ref=qnkosqbumadydglpbgmo`). It can inspect schema and documentation, but cannot write data or change schema.
 - `backend/package-lock.json` exists.
@@ -60,6 +60,7 @@ These are the working design decisions discussed so far:
 
 - Before running or adding commands, inspect `backend/package.json`. Available scripts: `npm run dev` / `npm start` (run `backend/src/index.js`), `npm test` (fails: no test runner configured).
 - Run the server from `backend/` with `npm run dev`.
+- Test routes: `GET /` (status), `GET /health` (Supabase reachability), `GET /test/groq` (Groq client configured?).
 - If adding scripts, define them in `backend/package.json` and run them from `backend/`.
 - Re-run `npm install` after changing `package.json` so `package-lock.json` stays in sync.
 - Do not add a frontend stack until the team chooses one.

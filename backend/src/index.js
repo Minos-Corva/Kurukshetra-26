@@ -1,6 +1,7 @@
 import express from "express";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
+import { Groq } from "groq-sdk";
 
 dotenv.config();
 
@@ -19,6 +20,10 @@ if (!supabaseUrl || !supabaseKey) {
 
 export const supabase = createClient(supabaseUrl, supabaseKey);
 
+export const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
+});
+
 app.get("/", (_req, res) => {
   res.json({ name: "W-PS-2 AI Career Coach", status: "ok" });
 });
@@ -31,6 +36,13 @@ app.get("/health", async (_req, res) => {
   } catch (err) {
     res.status(500).json({ status: "degraded", database: "unreachable", error: err.message });
   }
+});
+
+app.get("/test/groq", (_req, res) => {
+  res.json({
+    provider: "groq",
+    configured: Boolean(process.env.GROQ_API_KEY),
+  });
 });
 
 app.listen(PORT, () => {
