@@ -22,39 +22,44 @@ A missing signal means **“not demonstrated in the analyzed repository”**, no
 - Backend layer directories exist but are empty: `backend/src/controllers/`, `backend/src/repositories/`, and `backend/src/services/`.
 - Installed backend dependencies: `express`, `@supabase/supabase-js`, `zod`, `dotenv`, `octokit`, and `@huggingface/transformers`.
 - `backend/node_modules/` is installed and ignored by Git. The only known `.gitignore` entry is `/node_modules`.
-- `backend/opencode.json` registers a **read-only Supabase MCP server** for database and documentation features. It can help inspect schema and documentation, but it cannot be used to write application data or make schema changes.
+- `backend/opencode.json` registers a **read-only Supabase MCP server** for database and documentation features (`project_ref=qnkosqbumadydglpbgmo`). It can inspect schema and documentation, but cannot write data or change schema.
 - `backend/package-lock.json` exists.
 - There is no README, CI workflow, pre-commit configuration, or configured lockfile-based tooling beyond npm's package lock.
 
+## Supabase schema (remote project)
+
+The Supabase database already has 8 tables, all empty (0 rows), all with RLS enabled. This is the source of truth for data records — the "undecided" schema section below is resolved.
+
+| Table | Purpose |
+|---|---|
+| `job_postings` | One fetched job posting: `id uuid PK`, `source_url`, `title`, `company`, `raw_text`, `fetched_at`, `created_at`. FK target for `requirements` and `assessments`. |
+| `requirements` | Structured requirements extracted from a posting: `id uuid PK`, `job_posting_id FK`, `requirement_key` (stable ID across re-extraction), `skill`, `description`, `evidence_hints text[]`, `source_excerpt`, `sort_order`. |
+| `repositories` | The GitHub repo being analyzed: `id uuid PK`, `owner`, `name`, generated `full_name` (`owner || '/' || name`), `html_url`, `default_branch`. FK target for `code_chunks`, `repository_index_state`, `assessments`. |
+| `repository_index_state` | Change-detection state, 1:1 with `repositories` (`repository_id` is PK). `indexed_commit_sha`, `latest_seen_commit_sha`, `status` (`idle|running|failed`), `last_success_at`, `last_error`. Poller's working memory. |
+| `code_chunks` | pgvector store: `id uuid PK`, `repository_id FK`, `file_path`, `chunk_index >= 0`, `content`, `start_line`/`end_line`, `commit_sha`, `blob_sha`, `embedding_model`, `embedding_dimensions > 0`, `embedding vector`. Records model/dimensions per chunk so swaps are detectable by query. |
+| `assessments` | One assessment run: `id uuid PK`, `job_posting_id FK`, `repository_id FK`, `commit_sha`, `model_name`, `created_at`. A new commit SHA = a new assessment row (enables before/after demo). |
+| `requirement_assessments` | Per-requirement verdict: `id uuid PK`, `assessment_id FK`, `requirement_id FK`, `status` (CHECK: `demonstrated|partial|not_demonstrated|uncertain`), `explanation`, `confidence 0–1`. |
+| `assessment_evidence` | Citation layer linking a verdict to code: `id uuid PK`, `requirement_assessment_id FK`, nullable `code_chunk_id FK`, plus duplicated `file_path`, `start_line`/`end_line`, `commit_sha`, `quote`, `source_url`. Duplication is deliberate — verdicts stay readable after chunks are deleted or re-indexed. |
+
 ## Current architecture direction
 
-These are the working design decisions discussed so far, not a claim that the implementation is already present:
+These are the working design decisions discussed so far:
 
 1. **Node.js backend.** Keep API and pipeline orchestration in `backend/`. Use the existing ES module setup.
 2. **GitHub API through Octokit.** Analyze one real repository for the MVP. Read relevant source, tests, dependency manifests, and deployment/configuration files; skip generated and vendored content where practical.
-3. **Polling for repository changes.** Record the last successfully indexed commit SHA and periodically compare it with the latest SHA. Polling is the initial MVP approach; a webhook may be considered later.
-4. **Code embeddings in Supabase Postgres with pgvector.** Store chunks with repository identity, file path, line range, commit SHA, chunk index, content, and embedding. Supabase is the vector store and structured application database.
+3. **Polling for repository changes.** Record `indexed_commit_sha` vs `latest_seen_commit_sha` in `repository_index_state` and periodically compare. Polling is the initial MVP approach; a webhook may be considered later.
+4. **Code embeddings in Supabase Postgres with pgvector.** Store chunks in `code_chunks`. Supabase is the vector store and structured application database.
 5. **Hugging Face embeddings in JavaScript.** Use `@huggingface/transformers` for a compatible embedding model in Node.js. Use the same model and vector dimensions for repository chunks and requirement queries.
-6. **LLM for extraction and assessment.** Use an LLM to turn one real job posting into structured requirements, then assess requirements against retrieved code evidence. The LLM provider is not yet selected.
-7. **Evidence-first assessment.** Vector search retrieves candidate chunks; similarity is not proof of a skill. Have the LLM return a separate verdict for each requirement, with an explanation and repository file/line citations. Suggested statuses: `demonstrated`, `partial`, `not_demonstrated`, and `uncertain`.
-8. **Batch assessment where practical.** Retrieve evidence separately for each requirement, group it by requirement, and send the groups in one structured LLM request when they fit the context window. Split into batches if needed.
-9. **Incremental indexing.** For each changed file, generate replacement chunks and embeddings, then replace the old chunks for that repository/file. Remove chunks for deleted or newly excluded files. Handle renames by removing the old path and indexing the new path. Make updates idempotent and record the new indexed SHA only after all required indexing work succeeds.
+6. **LLM for extraction and assessment.** Use an LLM to turn one real job posting into structured requirements (`requirements`), then assess requirements against retrieved code evidence (`requirement_assessments`). The LLM provider is not yet selected.
+7. **Evidence-first assessment.** Vector search retrieves candidate chunks; similarity is not proof of a skill. Have the LLM return a separate verdict per requirement, with explanation and repository file/line citations stored in `assessment_evidence`.
+8. **Batch assessment where practical.** Retrieve evidence separately per requirement, group by requirement, and send groups in one structured LLM request when they fit the context window. Split into batches if needed.
+9. **Incremental indexing.** For each changed file, generate replacement chunks and embeddings in `code_chunks`, then replace old chunks for that repository/file. Remove chunks for deleted or newly excluded files. Handle renames by removing the old path and indexing the new path. Make updates idempotent and record the new indexed SHA only after all indexing work succeeds.
 10. **Before/after demo.** Show an initial assessment, make a real commit that changes relevant evidence, let polling trigger re-indexing and reassessment, and show the new result with citations.
-
-## Suggested data records
-
-Exact table names and schema are undecided. Keep the following concepts distinguishable:
-
-- **Job posting:** source URL, fetched text, and fetch timestamp.
-- **Requirement:** posting reference, stable requirement ID, skill, description, and evidence hints.
-- **Code chunk:** repository, path, line range, commit SHA, chunk index, text, and embedding.
-- **Assessment:** requirement ID, verdict, explanation, evidence references, repository SHA, and assessment timestamp.
-- **Repository indexing state:** repository identity, last successfully indexed SHA, and processing status/error.
 
 ## Repository and command guidance
 
-- Before running or adding commands, inspect `backend/package.json`. Do not assume `npm test`, `npm run dev`, build, or lint commands exist.
-- At the supplied starting state, `npm test` is known to fail with `"no test specified" && exit 1`; no test runner is configured.
+- Before running or adding commands, inspect `backend/package.json`. Available scripts: `npm run dev` / `npm start` (run `backend/src/index.js`), `npm test` (fails: no test runner configured).
+- Run the server from `backend/` with `npm run dev`.
 - If adding scripts, define them in `backend/package.json` and run them from `backend/`.
 - Re-run `npm install` after changing `package.json` so `package-lock.json` stays in sync.
 - Do not add a frontend stack until the team chooses one.
@@ -65,7 +70,6 @@ Exact table names and schema are undecided. Keep the following concepts distingu
 
 - Which LLM provider/model to use for requirement extraction and assessment.
 - The exact embedding model, vector dimensions, and chunking strategy.
-- The Supabase schema and migration approach.
 - Polling interval and how the poller is hosted/run during the demo.
 - The frontend framework and visualization of evidence.
 - Whether to add tests and which test runner to configure.
