@@ -1,0 +1,20 @@
+{
+  "mcp": {
+    "timeout": {
+      "startup": 60000,
+      "catalog": 60000,
+      "execution": 120000
+    },
+    "servers": {
+      "supabase": {
+        "type": "remote",
+        "url": "https://mcp.supabase.com/mcp?project_ref=qnkosqbumadydglpbgmo&read_only=true&features=database%2Cdocs",
+        "timeout": {
+          "startup": 60000,
+          "catalog": 60000,
+          "execution": 120000
+        }
+      }
+    }
+  }
+}
