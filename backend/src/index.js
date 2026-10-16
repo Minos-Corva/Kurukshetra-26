@@ -2,6 +2,10 @@ import express from "express";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import { Groq } from "groq-sdk";
+import { createJobPostingsRoutes } from "./routes/jobPostingsRoutes.js";
+import { JobPostingsRepository } from "./repositories/jobPostingsRepository.js";
+import { RequirementExtractionService } from "./services/requirementExtractionService.js";
+import { JobPostingsController } from "./controllers/jobPostingsController.js";
 
 dotenv.config();
 
@@ -12,17 +16,35 @@ app.use(express.json());
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+const groqApiKey = process.env.GROQ_API_KEY;
+const groqModel = process.env.GROQ_MODEL;
 
 if (!supabaseUrl || !supabaseKey) {
   console.error("Missing SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_ANON_KEY) env vars");
   process.exit(1);
 }
 
-export const supabase = createClient(supabaseUrl, supabaseKey);
+if (!groqApiKey) {
+  console.error("Missing GROQ_API_KEY env var");
+  process.exit(1);
+}
 
-export const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY,
-});
+if (!groqModel) {
+  console.error("Missing GROQ_MODEL env var");
+  process.exit(1);
+}
+
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+export { supabase };
+
+export const groq = new Groq({ apiKey: groqApiKey });
+
+const repository = new JobPostingsRepository({ supabaseClient: supabase });
+const extractionService = new RequirementExtractionService({ groqClient: groq, model: groqModel });
+const controller = new JobPostingsController({ extractionService, repository });
+
+app.use("/api", createJobPostingsRoutes({ controller }));
 
 app.get("/", (_req, res) => {
   res.json({ name: "W-PS-2 AI Career Coach", status: "ok" });
@@ -42,7 +64,26 @@ app.get("/test/groq", (_req, res) => {
   res.json({
     provider: "groq",
     configured: Boolean(process.env.GROQ_API_KEY),
+    model: process.env.GROQ_MODEL || "not configured",
   });
+});
+
+app.get("/test/groq/models", async (_req, res) => {
+  try {
+    const models = await groq.models.list();
+    const modelIds = models.data.map(({ id }) => id).sort();
+    res.json({
+      configured: Boolean(process.env.GROQ_API_KEY),
+      currentModel: process.env.GROQ_MODEL,
+      currentModelSupported: modelIds.includes(process.env.GROQ_MODEL || ""),
+      availableModels: modelIds,
+    });
+  } catch (err) {
+    res.status(502).json({
+      error: "Failed to list Groq models",
+      message: err.message,
+    });
+  }
 });
 
 app.listen(PORT, () => {

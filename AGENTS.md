@@ -18,9 +18,9 @@ A missing signal means **“not demonstrated in the analyzed repository”**, no
 - Top-level directories: `backend/` and `frontend/`.
 - `frontend/` is currently empty. No frontend framework or tooling has been selected; do not assume one.
 - The backend is a Node.js package using ES modules (`"type": "module"`).
-- Backend entry point: `backend/src/index.js` (currently empty).
-- Backend layer directories exist but are empty: `backend/src/controllers/`, `backend/src/repositories/`, and `backend/src/services/`.
-- Installed backend dependencies: `express`, `@supabase/supabase-js`, `zod`, `dotenv`, `octokit`, `@huggingface/transformers`, `groq-sdk`, and `openai`. Groq is wired up in `index.js` (exported as `groq`); `openai` is installed but unused.
+- Backend entry point: `backend/src/index.js` — Express server with `/api/job-postings` route, Supabase client, and Groq client wired up.
+- Backend layer directories now contain: `backend/src/controllers/jobPostingsController.js`, `backend/src/repositories/jobPostingsRepository.js`, `backend/src/services/requirementExtractionService.js`, `backend/src/routes/jobPostingsRoutes.js`
+- Installed backend dependencies: `express`, `@supabase/supabase-js`, `zod`, `dotenv`, `octokit`, `@huggingface/transformers`, and `groq-sdk`. Groq is wired up in `index.js` (exported as `groq`) for requirement extraction.
 - `backend/node_modules/` is installed and ignored by Git. The only known `.gitignore` entry is `/node_modules`.
 - `backend/opencode.json` registers a **read-only Supabase MCP server** for database and documentation features (`project_ref=qnkosqbumadydglpbgmo`). It can inspect schema and documentation, but cannot write data or change schema.
 - `backend/package-lock.json` exists.
@@ -50,7 +50,7 @@ These are the working design decisions discussed so far:
 3. **Polling for repository changes.** Record `indexed_commit_sha` vs `latest_seen_commit_sha` in `repository_index_state` and periodically compare. Polling is the initial MVP approach; a webhook may be considered later.
 4. **Code embeddings in Supabase Postgres with pgvector.** Store chunks in `code_chunks`. Supabase is the vector store and structured application database.
 5. **Hugging Face embeddings in JavaScript.** Use `@huggingface/transformers` for a compatible embedding model in Node.js. Use the same model and vector dimensions for repository chunks and requirement queries.
-6. **LLM for extraction and assessment.** Use an LLM to turn one real job posting into structured requirements (`requirements`), then assess requirements against retrieved code evidence (`requirement_assessments`). The LLM provider is not yet selected.
+6. **LLM for extraction and assessment.** Use Groq (`qwen/qwen3.8-27b` via `GROQ_MODEL` env var) to turn one real job posting into structured requirements (`requirements`), then assess requirements against retrieved code evidence (`requirement_assessments`).
 7. **Evidence-first assessment.** Vector search retrieves candidate chunks; similarity is not proof of a skill. Have the LLM return a separate verdict per requirement, with explanation and repository file/line citations stored in `assessment_evidence`.
 8. **Batch assessment where practical.** Retrieve evidence separately per requirement, group by requirement, and send groups in one structured LLM request when they fit the context window. Split into batches if needed.
 9. **Incremental indexing.** For each changed file, generate replacement chunks and embeddings in `code_chunks`, then replace old chunks for that repository/file. Remove chunks for deleted or newly excluded files. Handle renames by removing the old path and indexing the new path. Make updates idempotent and record the new indexed SHA only after all indexing work succeeds.
@@ -58,26 +58,31 @@ These are the working design decisions discussed so far:
 
 ## Repository and command guidance
 
-- Before running or adding commands, inspect `backend/package.json`. Available scripts: `npm run dev` / `npm start` (run `backend/src/index.js`), `npm test` (fails: no test runner configured).
+- Before running or adding commands, inspect `backend/package.json`. Available scripts: `npm run dev` / `npm start` (run `backend/src/index.js`), `npm test` (runs `node --test`).
 - Run the server from `backend/` with `npm run dev`.
-- Test routes: `GET /` (status), `GET /health` (Supabase reachability), `GET /test/groq` (Groq client configured?).
+- Test routes: `GET /` (status), `GET /health` (Supabase reachability), `GET /test/groq` (Groq client configured?), `GET /test/groq/models` (list available Groq models and verify key).
+- API endpoint: `POST /api/job-postings` — accepts `{ sourceUrl, postingText }`, extracts requirements via Groq, validates with Zod, persists to Supabase `job_postings` + `requirements` tables.
+- Required env vars: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (or `SUPABASE_ANON_KEY`), `GROQ_API_KEY`, `GROQ_MODEL`. See `backend/.env.example`.
 - If adding scripts, define them in `backend/package.json` and run them from `backend/`.
 - Re-run `npm install` after changing `package.json` so `package-lock.json` stays in sync.
 - Do not add a frontend stack until the team chooses one.
 - Keep secrets out of source control and the frontend. Use environment configuration for tokens and service credentials; document required variable names without committing values.
 - The Supabase MCP is read-only. Use normal application credentials and migrations or SQL under an explicitly authorized workflow for writes/schema changes; never assume the MCP can perform them.
+- Tests: `backend/src/jobPostings.test.js` uses Node's built-in `node:test` with mocked Groq and Supabase. Run with `npm test` from `backend/`.
 
 ## Embedding model
 
 Chosen: **`Xenova/all-MiniLM-L6-v2`** (Hugging Face), **384 dimensions**. Runs in Node.js via the already-installed `@huggingface/transformers`. Record `embedding_model` and `embedding_dimensions` per chunk in `code_chunks` so a future model swap is detectable by query.
 
+## LLM model
+
+Chosen: **Groq** with **`qwen/qwen3.8-27b`** (configured via `GROQ_MODEL` env var). Confirmed supported for this account via `GET /test/groq/models`. Record `model_name` per assessment in `assessments` table. To change models, update `GROQ_MODEL` in `.env` and restart the server.
+
 ## Still to decide
 
-- Which LLM provider/model to use for requirement extraction and assessment (Groq is installed and wired as a client; provider not yet committed).
 - Chunking strategy (size, overlap, which file types to include/exclude).
 - Polling interval and how the poller is hosted/run during the demo.
 - The frontend framework and visualization of evidence.
-- Whether to add tests and which test runner to configure.
 
 
 Prefer the smallest implementation that proves the complete change-detection and reassessment loop. Optional resume editing, career research, learning plans, and multi-repository support are outside the initial MVP unless the team explicitly expands scope.
