@@ -2,10 +2,17 @@ import express from "express";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import { Groq } from "groq-sdk";
+import { Octokit } from "octokit";
 import { createJobPostingsRoutes } from "./routes/jobPostingsRoutes.js";
 import { JobPostingsRepository } from "./repositories/jobPostingsRepository.js";
 import { RequirementExtractionService } from "./services/requirementExtractionService.js";
 import { JobPostingsController } from "./controllers/jobPostingsController.js";
+import { createRepositoriesRoutes } from "./routes/repositoriesRoutes.js";
+import { RepositoriesRepository } from "./repositories/repositoriesRepository.js";
+import { GithubIngestionService } from "./services/githubIngestionService.js";
+import { ChunkingService } from "./services/chunkingService.js";
+import { EmbeddingService } from "./services/embeddingService.js";
+import { RepositoriesController } from "./controllers/repositoriesController.js";
 
 dotenv.config();
 
@@ -40,11 +47,27 @@ export { supabase };
 
 export const groq = new Groq({ apiKey: groqApiKey });
 
+export const octokit = new Octokit({
+  auth: process.env.GITHUB_TOKEN || undefined,
+});
+
 const repository = new JobPostingsRepository({ supabaseClient: supabase });
 const extractionService = new RequirementExtractionService({ groqClient: groq, model: groqModel });
 const controller = new JobPostingsController({ extractionService, repository });
 
+const repositoriesRepo = new RepositoriesRepository({ supabaseClient: supabase });
+const githubService = new GithubIngestionService({ octokit });
+const chunkingService = new ChunkingService();
+const embeddingService = new EmbeddingService();
+const repositoriesController = new RepositoriesController({
+  githubService,
+  chunkingService,
+  embeddingService,
+  repository: repositoriesRepo,
+});
+
 app.use("/api", createJobPostingsRoutes({ controller }));
+app.use("/api", createRepositoriesRoutes({ controller: repositoriesController }));
 
 app.get("/", (_req, res) => {
   res.json({ name: "W-PS-2 AI Career Coach", status: "ok" });
