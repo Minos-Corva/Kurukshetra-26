@@ -67,12 +67,17 @@ These are the working design decisions discussed so far:
 - Keep secrets out of source control and the frontend. Use environment configuration for tokens and service credentials; document required variable names without committing values.
 - The Supabase MCP is read-only. Use normal application credentials and migrations or SQL under an explicitly authorized workflow for writes/schema changes; never assume the MCP can perform them.
 
+## Embedding model
+
+Chosen: **`Xenova/all-MiniLM-L6-v2`** (Hugging Face), **384 dimensions**. Runs in Node.js via the already-installed `@huggingface/transformers`. Record `embedding_model` and `embedding_dimensions` per chunk in `code_chunks` so a future model swap is detectable by query.
+
 ## Still to decide
 
-- Which LLM provider/model to use for requirement extraction and assessment.
-- The exact embedding model, vector dimensions, and chunking strategy.
+- Which LLM provider/model to use for requirement extraction and assessment (Groq is installed and wired as a client; provider not yet committed).
+- Chunking strategy (size, overlap, which file types to include/exclude).
 - Polling interval and how the poller is hosted/run during the demo.
 - The frontend framework and visualization of evidence.
 - Whether to add tests and which test runner to configure.
+
 
 Prefer the smallest implementation that proves the complete change-detection and reassessment loop. Optional resume editing, career research, learning plans, and multi-repository support are outside the initial MVP unless the team explicitly expands scope.
