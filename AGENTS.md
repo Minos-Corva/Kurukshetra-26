@@ -25,8 +25,9 @@ A missing signal means **“not demonstrated in the analyzed repository”**, no
   - Feature 6 (evidence retrieval): `backend/src/controllers/evidenceController.js`, `backend/src/repositories/evidenceRepository.js`, `backend/src/services/evidenceService.js`, `backend/src/routes/evidenceRoutes.js`
   - Feature 7 (requirement assessment): `backend/src/controllers/assessmentsController.js`, `backend/src/repositories/assessmentRepository.js`, `backend/src/services/assessmentService.js`, `backend/src/routes/assessmentsRoutes.js`
   - Feature 8 (assessment display UI): `frontend/index.html`, `frontend/styles.css`, `frontend/app.js`, `frontend/config.js` (no backend modules added; `backend/src/index.js` gained a static mount only)
-  - Test files: `backend/src/jobPostings.test.js`, `backend/src/repositories.test.js`, `backend/src/chunking-embedding.test.js` (Feature 5 focused checks, 17 tests), `backend/src/evidence.test.js` (Feature 6, 14 tests), `backend/src/assessments.test.js` (Feature 7, 16 tests)
-  - Smoke test: `backend/src/smoke-test-ingest.js` (run with `npm run smoke-test [owner] [repo]`)
+  - Feature 9 (polling & incremental updates): `backend/src/services/pollingService.js`, `backend/src/poll-repositories.js`, updated `backend/src/repositories/repositoriesRepository.js`, updated `backend/src/services/githubIngestionService.js`, wired in `backend/src/index.js`
+  - Test files: `backend/src/jobPostings.test.js`, `backend/src/repositories.test.js`, `backend/src/chunking-embedding.test.js` (Feature 5 focused checks, 17 tests), `backend/src/evidence.test.js` (Feature 6, 14 tests), `backend/src/assessments.test.js` (Feature 7, 16 tests), `backend/src/polling.test.js` (Feature 9, 12 tests)
+  - Smoke tests / CLI scripts: `backend/src/smoke-test-ingest.js` (run with `npm run smoke-test [owner] [repo]`), `backend/src/poll-repositories.js` (run with `npm run poll` or `npm run poll:watch`)
 
 - Installed backend dependencies: `express`, `@supabase/supabase-js`, `zod`, `dotenv`, `octokit`, `@huggingface/transformers`, and `groq-sdk`. Groq is wired up in `index.js` (exported as `groq`) for requirement extraction.
 - `backend/node_modules/` is installed and ignored by Git. The only known `.gitignore` entry is `/node_modules`.
@@ -182,20 +183,58 @@ The UI is plain HTML/CSS/JavaScript with **no framework, no build step, and no d
 - API errors surface only the backend's sanitized `error` / `message` / `details` — never raw response text.
 - `GET /app/` scores 1.0 for Lighthouse accessibility, best practices, and SEO, both on load and with a full assessment rendered.
 
-**Open gap:** there is no endpoint to list job postings, repositories, or past assessments, so the UI depends on IDs returned in the current session or entered by hand.
+## GitHub commit polling and incremental repository updates (Feature 9)
+
+Implemented in `backend/src/services/pollingService.js`, `backend/src/poll-repositories.js`, `backend/src/repositories/repositoriesRepository.js`, `backend/src/services/githubIngestionService.js`, and `backend/src/index.js`. Tested in `backend/src/polling.test.js` (12 tests; total test suite is 74 tests, all passing).
+
+**Goal:** Watch configured GitHub repositories on their target branches for new commits. When the branch advances, update the indexed code incrementally so changed files have current chunks and embeddings, deleted files have their stale chunks removed, and unchanged files are never reprocessed.
+
+**Execution modes:**
+- **Single cycle (CLI / manual verification):** `npm run poll` (or `node src/poll-repositories.js`) checks all tracked repositories once and logs a summary table. Single repository: `node src/poll-repositories.js <owner> <repo> [branch]`.
+- **Continuous watcher (CLI):** `npm run poll:watch` (or `node src/poll-repositories.js --watch`) runs continuously with interval defined by `POLL_INTERVAL_SECONDS` (default 60s).
+- **In-process background daemon:** Setting `ENABLE_POLLING=true` in `.env` starts the `PollingService` timer on server boot (`pollingService.start()`). Interval configured via `POLL_INTERVAL_SECONDS` (default 60s).
+- **Protected HTTP endpoint:** `POST /api/polling/run` allows triggering polling via HTTP only when `POLLING_SECRET` is configured in `.env` and sent in the `x-polling-secret` header. If `POLLING_SECRET` is unset, the endpoint returns `404`; if the header is incorrect, it returns `401`. Arbitrary callers cannot trigger polling unauthenticated.
+
+**Incremental update workflow:**
+1. Loads tracked repositories from `repositories` and `repository_index_state`.
+2. Resolves target branch (`branch` or `default_branch` or `"main"`) and fetches latest commit SHA from GitHub via Octokit (`repos.getCommit`).
+3. Compares `latestCommitSha` against `repository_index_state.indexed_commit_sha`:
+   - If identical, skips processing immediately (`status: "unchanged"`). Chunks and embeddings are not touched.
+   - If `indexed_commit_sha` is null (never indexed before), runs initial ingestion (`ingestRepository` + chunk + embed + persist).
+   - If commit has advanced:
+     a. Sets repository index state to `running` with `latest_seen_commit_sha = latestCommitSha`.
+     b. Fetches commit comparison from GitHub via `repos.compareCommits`.
+     c. Categorizes changed files:
+        - `removed`: deletes all chunks where `file_path = filename`.
+        - `renamed`: deletes chunks for `previous_filename` and `filename`; checks eligibility of `filename` (if eligible & within size limit, fetches blob, chunks, embeds, and inserts).
+        - `modified` / `changed`: deletes existing chunks for `filename`; if eligible, fetches blob, chunks, embeds, and inserts new chunks.
+        - `added` / `copied`: deletes any existing chunks for `filename` (for retry idempotency); if eligible, fetches blob, chunks, embeds, and inserts new chunks.
+        - Excluded/unsupported files (e.g. `.png`, `.env`, `package-lock.json`, minified files) and oversized files (> 100 KB) are skipped and counted in stats. Any previous chunks for files that grew oversized or became ineligible are deleted.
+     d. Embeds only the new/modified chunks in batches via `EmbeddingService.embedChunks`.
+     e. Executes database updates: removes stale chunks (`deleteChunksForFiles`), inserts new chunks (`insertChunks`), and updates index state to `idle` (`updateIndexStateSuccess`).
+     f. `indexed_commit_sha` is advanced ONLY after all file deletions, chunk insertions, and state updates succeed.
+     g. If an error occurs midway, `indexed_commit_sha` is left intact at the old SHA and status is marked `failed` so the subsequent poll retries the diff.
+
+**Concurrency & overlap prevention:**
+- In-process mutex (`activeRepoRuns = new Set()`) prevents overlapping poll runs for the same repository.
+- DB guard checks if a repository was marked `running` recently (< 10 minutes ago) to avoid collision across workers.
+
+**Logging & credential safety:**
+- Logs only repository name, old/new commit SHAs, file change counts (+added, ~modified, -deleted, ->renamed, skipped, oversized), and chunk metrics.
+- Never logs credentials, tokens, or source file contents.
 
 ## Implementation status
 
-- **Implemented and verified live:** requirement extraction (`POST /api/job-postings` → Groq), repository ingestion/chunking/embedding (`POST /api/repositories/ingest`), evidence retrieval with citations (`POST /api/evidence/retrieve`), requirement-by-requirement assessment with persisted verdicts and citations (`POST /api/assessments`), and the change-detection *data model* in `repository_index_state` (re-ingesting the same commit SHA is a no-op; chunks are replaced when the SHA changes). A live run against `expressjs/cors` (commit `5317ebe6…`) assessed a 10-requirement posting as 6 `supported` + 4 `not_found`, persisted 1 `assessments` row, 10 `requirement_assessments` rows, and 13 `assessment_evidence` rows.
+- **Implemented and verified live:** requirement extraction (`POST /api/job-postings` → Groq), repository ingestion/chunking/embedding (`POST /api/repositories/ingest`), evidence retrieval with citations (`POST /api/evidence/retrieve`), requirement-by-requirement assessment with persisted verdicts and citations (`POST /api/assessments`), change-detection & commit polling (`PollingService`, `npm run poll`, `npm run poll:watch`, `POST /api/polling/run` with `POLLING_SECRET`), and the change-detection *data model* in `repository_index_state`.
 - **Frontend verified:** the Feature 8 UI at `GET /app/` was driven end-to-end in a browser against the live backend (posting → index `expressjs/cors` → assess → 10 rendered requirement cards with 13 commit-pinned evidence links; a `422` unindexed-repository error and a preserved-input error path were also exercised). `GET /app/` scored 1.0 on Lighthouse accessibility, best practices, and SEO.
 - **Missing endpoints the UI works around:** there is no `GET` for job postings, repositories, or past assessments, and no endpoint that reads index status on its own. The UI therefore relies on IDs returned by the write endpoints (or manual entry) and on the ingest response for index status.
-- **Not implemented yet:** the poller that watches for new commits, and the automatic reassessment trigger. Assessment can be requested manually, but nothing yet detects a changed SHA and re-runs it. A manual re-assessment on a new commit SHA will produce a new row, which is enough to demonstrate before/after by hand.
+- **Automatic reassessment trigger:** Polling advances index state and updates chunks incrementally; the final integration hook that automatically triggers reassessment following a successful incremental update is ready to be connected once the reassessment strategy (immediate run vs user-notified) is finalized.
 
 ## Still to decide
 
-- Polling interval and how the poller is hosted/run during the demo.
+- Hosting and deployment model for long-running poller in production (e.g., background daemon process in container, external cron/scheduled task calling `npm run poll`, or serverless scheduled invocation via protected `POST /api/polling/run`).
+- Automatic reassessment strategy: whether a commit advancement should immediately trigger an LLM reassessment run in the background or flag the repository as "update available" for user-triggered reassessment.
 - Frontend framework: **decided** — dependency-free vanilla HTML/CSS/JS served at `/app` (see **Frontend (Feature 8)**). Revisit only if the team wants a framework and a build step.
 - Further UI work (not started): a picker for existing postings/repositories/assessments, which needs new `GET` endpoints; and richer evidence display (code excerpts / diff view) beyond the current file + line-range links.
-
 
 Prefer the smallest implementation that proves the complete change-detection and reassessment loop. Optional resume editing, career research, learning plans, and multi-repository support are outside the initial MVP unless the team explicitly expands scope.

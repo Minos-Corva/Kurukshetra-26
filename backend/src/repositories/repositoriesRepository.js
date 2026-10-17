@@ -266,4 +266,169 @@ export class RepositoriesRepository {
 
     return count || 0;
   }
+
+  /**
+   * Find a repository by UUID.
+   *
+   * @param {string} repositoryId
+   * @returns {Promise<object|null>}
+   */
+  async getRepositoryById(repositoryId) {
+    const { data, error } = await this.supabase
+      .from("repositories")
+      .select("*")
+      .eq("id", repositoryId)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to query repository by id: ${error.message}`);
+    }
+
+    return data;
+  }
+
+  /**
+   * List all tracked repositories with their latest index state.
+   *
+   * @returns {Promise<Array<object>>}
+   */
+  async listTrackedRepositories() {
+    const { data: repos, error: reposErr } = await this.supabase
+      .from("repositories")
+      .select("*")
+      .order("created_at", { ascending: true });
+
+    if (reposErr) {
+      throw new Error(`Failed to list repositories: ${reposErr.message}`);
+    }
+
+    if (!repos || repos.length === 0) {
+      return [];
+    }
+
+    const repoIds = repos.map((r) => r.id);
+    const { data: states, error: statesErr } = await this.supabase
+      .from("repository_index_state")
+      .select("*")
+      .in("repository_id", repoIds);
+
+    if (statesErr) {
+      throw new Error(`Failed to load repository_index_state: ${statesErr.message}`);
+    }
+
+    const stateMap = new Map((states || []).map((s) => [s.repository_id, s]));
+
+    return repos.map((r) => ({
+      ...r,
+      indexState: stateMap.get(r.id) || null,
+    }));
+  }
+
+  /**
+   * Delete code chunks for specific file paths in a repository.
+   *
+   * @param {object} params
+   * @param {string} params.repositoryId
+   * @param {string[]} params.filePaths
+   * @returns {Promise<number>} Number of deleted chunks
+   */
+  async deleteChunksForFiles({ repositoryId, filePaths }) {
+    if (!repositoryId) throw new Error("repositoryId is required");
+    if (!Array.isArray(filePaths) || filePaths.length === 0) return 0;
+
+    const BATCH_SIZE = 100;
+    let totalDeleted = 0;
+
+    for (let i = 0; i < filePaths.length; i += BATCH_SIZE) {
+      const batch = filePaths.slice(i, i + BATCH_SIZE);
+      const { data, error, count } = await this.supabase
+        .from("code_chunks")
+        .delete({ count: "exact" })
+        .eq("repository_id", repositoryId)
+        .in("file_path", batch);
+
+      if (error) {
+        throw new Error(`Failed to delete chunks for files: ${error.message}`);
+      }
+
+      totalDeleted += (count ?? (Array.isArray(data) ? data.length : 0));
+    }
+
+    return totalDeleted;
+  }
+
+  /**
+   * Insert new embedded code chunks in batches.
+   *
+   * @param {object} params
+   * @param {string} params.repositoryId
+   * @param {Array<object>} params.embeddedChunks
+   * @returns {Promise<number>}
+   */
+  async insertChunks({ repositoryId, embeddedChunks }) {
+    if (!repositoryId) throw new Error("repositoryId is required");
+    if (!Array.isArray(embeddedChunks) || embeddedChunks.length === 0) return 0;
+
+    const rows = embeddedChunks.map((chunk) => ({
+      repository_id: repositoryId,
+      file_path: chunk.file_path,
+      chunk_index: chunk.chunk_index,
+      content: chunk.content,
+      start_line: chunk.start_line,
+      end_line: chunk.end_line,
+      commit_sha: chunk.commit_sha,
+      blob_sha: chunk.blob_sha,
+      embedding_model: chunk.embedding_model,
+      embedding_dimensions: chunk.embedding_dimensions,
+      embedding: chunk.embedding,
+    }));
+
+    const BATCH_SIZE = 100;
+    for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+      const batch = rows.slice(i, i + BATCH_SIZE);
+      const { error } = await this.supabase
+        .from("code_chunks")
+        .insert(batch);
+
+      if (error) {
+        throw new Error(`Failed to insert code_chunks batch: ${error.message}`);
+      }
+    }
+
+    return rows.length;
+  }
+
+  /**
+   * Update index state to 'idle' with newly indexed commit SHA.
+   *
+   * @param {object} params
+   * @param {string} params.repositoryId
+   * @param {string} params.commitSha
+   * @returns {Promise<object>}
+   */
+  async updateIndexStateSuccess({ repositoryId, commitSha }) {
+    const { data, error } = await this.supabase
+      .from("repository_index_state")
+      .upsert(
+        {
+          repository_id: repositoryId,
+          indexed_commit_sha: commitSha,
+          latest_seen_commit_sha: commitSha,
+          status: "idle",
+          last_success_at: new Date().toISOString(),
+          last_error: null,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "repository_id" }
+      )
+      .select("*")
+      .single();
+
+    if (error) {
+      throw new Error(`Failed to update index state to success: ${error.message}`);
+    }
+
+    return data;
+  }
 }
+

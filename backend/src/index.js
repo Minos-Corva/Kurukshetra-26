@@ -23,6 +23,7 @@ import { AssessmentRepository } from "./repositories/assessmentRepository.js";
 import { AssessmentService } from "./services/assessmentService.js";
 import { AssessmentsController } from "./controllers/assessmentsController.js";
 import { createAssessmentsRoutes } from "./routes/assessmentsRoutes.js";
+import { PollingService } from "./services/pollingService.js";
 
 dotenv.config();
 
@@ -59,6 +60,12 @@ export const groq = new Groq({ apiKey: groqApiKey });
 
 export const octokit = new Octokit({
   auth: process.env.GITHUB_TOKEN || undefined,
+  retry: { enabled: false },
+  request: { retries: 0 },
+  throttle: {
+    onRateLimit: () => false,
+    onSecondaryRateLimit: () => false,
+  },
 });
 
 const repository = new JobPostingsRepository({ supabaseClient: supabase });
@@ -94,10 +101,47 @@ const assessmentService = new AssessmentService({
 });
 const assessmentsController = new AssessmentsController({ assessmentService });
 
+const pollIntervalSeconds = Number(process.env.POLL_INTERVAL_SECONDS) || 60;
+export const pollingService = new PollingService({
+  githubService,
+  chunkingService,
+  embeddingService,
+  repository: repositoriesRepo,
+  pollingIntervalMs: pollIntervalSeconds * 1000,
+});
+
+if (process.env.ENABLE_POLLING === "true") {
+  pollingService.start();
+}
+
 app.use("/api", createJobPostingsRoutes({ controller }));
 app.use("/api", createRepositoriesRoutes({ controller: repositoriesController }));
 app.use("/api", createEvidenceRoutes({ controller: evidenceController }));
 app.use("/api", createAssessmentsRoutes({ controller: assessmentsController }));
+
+// Protected polling endpoint — only accessible if POLLING_SECRET is configured
+app.post("/api/polling/run", async (req, res) => {
+  const secret = process.env.POLLING_SECRET;
+  if (!secret) {
+    return res.status(404).json({ error: "Polling endpoint is not enabled" });
+  }
+  const provided = req.headers["x-polling-secret"];
+  if (!provided || provided !== secret) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  try {
+    const { repositoryId, owner, name, branch } = req.body || {};
+    if (repositoryId || (owner && name)) {
+      const result = await pollingService.pollRepository({ repositoryId, owner, name, branch });
+      return res.json(result);
+    }
+    const result = await pollingService.pollAll();
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({ error: "Polling cycle failed", message: err.message });
+  }
+});
 
 // Feature 8: serve the static assessment UI from the same origin as the API so the
 // browser never needs CORS. This only serves files; the API itself is unchanged.
