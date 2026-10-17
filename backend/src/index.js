@@ -1,4 +1,6 @@
 import express from "express";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import { Groq } from "groq-sdk";
@@ -97,8 +99,17 @@ app.use("/api", createRepositoriesRoutes({ controller: repositoriesController })
 app.use("/api", createEvidenceRoutes({ controller: evidenceController }));
 app.use("/api", createAssessmentsRoutes({ controller: assessmentsController }));
 
+// Feature 8: serve the static assessment UI from the same origin as the API so the
+// browser never needs CORS. This only serves files; the API itself is unchanged.
+// Override the location with FRONTEND_DIR if the UI lives elsewhere.
+const frontendDir = process.env.FRONTEND_DIR
+  ? path.resolve(process.env.FRONTEND_DIR)
+  : path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../frontend");
+
+app.use("/app", express.static(frontendDir));
+
 app.get("/", (_req, res) => {
-  res.json({ name: "W-PS-2 AI Career Coach", status: "ok" });
+  res.json({ name: "W-PS-2 AI Career Coach", status: "ok", ui: "/app/" });
 });
 
 app.get("/health", async (_req, res) => {
