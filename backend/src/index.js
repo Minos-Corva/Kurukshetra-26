@@ -17,6 +17,10 @@ import { EvidenceRepository } from "./repositories/evidenceRepository.js";
 import { EvidenceService } from "./services/evidenceService.js";
 import { EvidenceController } from "./controllers/evidenceController.js";
 import { createEvidenceRoutes } from "./routes/evidenceRoutes.js";
+import { AssessmentRepository } from "./repositories/assessmentRepository.js";
+import { AssessmentService } from "./services/assessmentService.js";
+import { AssessmentsController } from "./controllers/assessmentsController.js";
+import { createAssessmentsRoutes } from "./routes/assessmentsRoutes.js";
 
 dotenv.config();
 
@@ -79,9 +83,19 @@ const evidenceController = new EvidenceController({
   evidenceService,
 });
 
+const assessmentRepo = new AssessmentRepository({ supabaseClient: supabase });
+const assessmentService = new AssessmentService({
+  evidenceService,
+  groqClient: groq,
+  model: groqModel,
+  repository: assessmentRepo,
+});
+const assessmentsController = new AssessmentsController({ assessmentService });
+
 app.use("/api", createJobPostingsRoutes({ controller }));
 app.use("/api", createRepositoriesRoutes({ controller: repositoriesController }));
 app.use("/api", createEvidenceRoutes({ controller: evidenceController }));
+app.use("/api", createAssessmentsRoutes({ controller: assessmentsController }));
 
 app.get("/", (_req, res) => {
   res.json({ name: "W-PS-2 AI Career Coach", status: "ok" });
