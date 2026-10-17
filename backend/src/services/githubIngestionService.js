@@ -289,6 +289,131 @@ export class GithubIngestionService {
     };
   }
 
+  /**
+   * Get the current commit SHA for a branch (or default branch).
+   *
+   * @param {object} params
+   * @param {string} params.owner
+   * @param {string} params.name
+   * @param {string} [params.ref]
+   * @returns {Promise<{ sha: string, branch: string, defaultBranch?: string }>}
+   */
+  async getCommitSha({ owner, name, ref }) {
+    if (!owner || typeof owner !== "string") throw new Error("owner is required");
+    if (!name || typeof name !== "string") throw new Error("name is required");
+
+    let targetBranch = ref;
+    let defaultBranch = null;
+
+    if (!targetBranch) {
+      try {
+        const repoRes = await this.octokit.rest.repos.get({ owner, repo: name });
+        defaultBranch = repoRes.data.default_branch;
+        targetBranch = defaultBranch;
+      } catch (err) {
+        this._handleOctokitError(err, `repository ${owner}/${name}`);
+      }
+    }
+
+    try {
+      const commitRes = await this.octokit.rest.repos.getCommit({
+        owner,
+        repo: name,
+        ref: targetBranch,
+      });
+      return {
+        sha: commitRes.data.sha,
+        branch: targetBranch,
+        ...(defaultBranch ? { defaultBranch } : {}),
+      };
+    } catch (err) {
+      this._handleOctokitError(err, `commit for branch ${targetBranch} in ${owner}/${name}`);
+    }
+  }
+
+  /**
+   * Compare two commits and return changed files and commit stats.
+   *
+   * @param {object} params
+   * @param {string} params.owner
+   * @param {string} params.name
+   * @param {string} params.baseSha
+   * @param {string} params.headSha
+   * @returns {Promise<{
+   *   status: string,
+   *   aheadBy: number,
+   *   behindBy: number,
+   *   totalCommits: number,
+   *   files: Array<object>
+   * }>}
+   */
+  async compareCommits({ owner, name, baseSha, headSha }) {
+    if (!owner || typeof owner !== "string") throw new Error("owner is required");
+    if (!name || typeof name !== "string") throw new Error("name is required");
+    if (!baseSha || typeof baseSha !== "string") throw new Error("baseSha is required");
+    if (!headSha || typeof headSha !== "string") throw new Error("headSha is required");
+
+    try {
+      const res = await this.octokit.rest.repos.compareCommits({
+        owner,
+        repo: name,
+        base: baseSha,
+        head: headSha,
+      });
+
+      return {
+        status: res.data.status,
+        aheadBy: res.data.ahead_by,
+        behindBy: res.data.behind_by,
+        totalCommits: res.data.total_commits,
+        files: res.data.files || [],
+      };
+    } catch (err) {
+      this._handleOctokitError(err, `commit comparison ${baseSha}...${headSha} in ${owner}/${name}`);
+    }
+  }
+
+  /**
+   * Fetch and decode a blob's content from GitHub.
+   *
+   * @param {object} params
+   * @param {string} params.owner
+   * @param {string} params.name
+   * @param {string} params.fileSha
+   * @returns {Promise<{ content: string, size: number }>}
+   */
+  async fetchBlobContent({ owner, name, fileSha }) {
+    if (!owner || typeof owner !== "string") throw new Error("owner is required");
+    if (!name || typeof name !== "string") throw new Error("name is required");
+    if (!fileSha || typeof fileSha !== "string") throw new Error("fileSha is required");
+
+    try {
+      const blobRes = await this.octokit.rest.git.getBlob({
+        owner,
+        repo: name,
+        file_sha: fileSha,
+      });
+
+      const rawContent = blobRes.data.content;
+      const encoding = blobRes.data.encoding;
+      const size = blobRes.data.size || 0;
+
+      let content = "";
+      if (encoding === "base64") {
+        content = Buffer.from(rawContent, "base64").toString("utf-8");
+      } else {
+        content = rawContent || "";
+      }
+
+      return {
+        content,
+        size: size || Buffer.byteLength(content, "utf-8"),
+      };
+    } catch (err) {
+      this._handleOctokitError(err, `blob ${fileSha} in ${owner}/${name}`);
+    }
+  }
+
   _handleOctokitError(err, contextDescription) {
     const status = err.status || (err.response && err.response.status);
     if (status === 404) {
@@ -300,3 +425,4 @@ export class GithubIngestionService {
     throw new Error(`GitHub API error (${status || "unknown"}): ${err.message || "Failed to communicate with GitHub"}`);
   }
 }
+

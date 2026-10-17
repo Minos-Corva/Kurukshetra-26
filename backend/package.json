@@ -7,7 +7,9 @@
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
     "test": "node --test",
-    "smoke-test": "node src/smoke-test-ingest.js"
+    "smoke-test": "node src/smoke-test-ingest.js",
+    "poll": "node src/poll-repositories.js",
+    "poll:watch": "node src/poll-repositories.js --watch"
   },
   "keywords": [],
   "author": "",
