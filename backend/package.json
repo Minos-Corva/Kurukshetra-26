@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "node src/index.js",
     "start": "node src/index.js",
-    "test": "node --test"
+    "test": "node --test",
+    "smoke-test": "node src/smoke-test-ingest.js"
   },
   "keywords": [],
   "author": "",

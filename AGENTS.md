@@ -19,7 +19,12 @@ A missing signal means **“not demonstrated in the analyzed repository”**, no
 - `frontend/` is currently empty. No frontend framework or tooling has been selected; do not assume one.
 - The backend is a Node.js package using ES modules (`"type": "module"`).
 - Backend entry point: `backend/src/index.js` — Express server with `/api/job-postings` route, Supabase client, and Groq client wired up.
-- Backend layer directories now contain: `backend/src/controllers/jobPostingsController.js`, `backend/src/repositories/jobPostingsRepository.js`, `backend/src/services/requirementExtractionService.js`, `backend/src/routes/jobPostingsRoutes.js`
+- Backend layer directories now contain:
+  - Feature 3: `backend/src/controllers/jobPostingsController.js`, `backend/src/repositories/jobPostingsRepository.js`, `backend/src/services/requirementExtractionService.js`, `backend/src/routes/jobPostingsRoutes.js`
+  - Feature 4 & 5 (chunking + embedding pipeline): `backend/src/controllers/repositoriesController.js`, `backend/src/repositories/repositoriesRepository.js`, `backend/src/routes/repositoriesRoutes.js`, `backend/src/services/githubIngestionService.js`, `backend/src/services/chunkingService.js`, `backend/src/services/embeddingService.js`
+  - Test files: `backend/src/jobPostings.test.js`, `backend/src/repositories.test.js`, `backend/src/chunking-embedding.test.js` (Feature 5 focused checks, 17 tests)
+  - Smoke test: `backend/src/smoke-test-ingest.js` (run with `npm run smoke-test [owner] [repo]`)
+
 - Installed backend dependencies: `express`, `@supabase/supabase-js`, `zod`, `dotenv`, `octokit`, `@huggingface/transformers`, and `groq-sdk`. Groq is wired up in `index.js` (exported as `groq`) for requirement extraction.
 - `backend/node_modules/` is installed and ignored by Git. The only known `.gitignore` entry is `/node_modules`.
 - `backend/opencode.json` registers a **read-only Supabase MCP server** for database and documentation features (`project_ref=qnkosqbumadydglpbgmo`). It can inspect schema and documentation, but cannot write data or change schema.
@@ -58,21 +63,39 @@ These are the working design decisions discussed so far:
 
 ## Repository and command guidance
 
-- Before running or adding commands, inspect `backend/package.json`. Available scripts: `npm run dev` / `npm start` (run `backend/src/index.js`), `npm test` (runs `node --test`).
+- Before running or adding commands, inspect `backend/package.json`. Available scripts: `npm run dev` / `npm start` (run `backend/src/index.js`), `npm test` (runs `node --test`), `npm run smoke-test [owner] [repo]` (manual ingest smoke test, requires a running server).
 - Run the server from `backend/` with `npm run dev`.
 - Test routes: `GET /` (status), `GET /health` (Supabase reachability), `GET /test/groq` (Groq client configured?), `GET /test/groq/models` (list available Groq models and verify key).
 - API endpoint: `POST /api/job-postings` — accepts `{ sourceUrl, postingText }`, extracts requirements via Groq, validates with Zod, persists to Supabase `job_postings` + `requirements` tables.
-- Required env vars: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (or `SUPABASE_ANON_KEY`), `GROQ_API_KEY`, `GROQ_MODEL`. See `backend/.env.example`.
+- API endpoint: `POST /api/repositories/ingest` — accepts `{ owner, name, branch? }`, fetches GitHub files, chunks, embeds, and persists to `repositories`, `repository_index_state`, and `code_chunks`. Idempotent on same commit SHA.
+- Required env vars: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (or `SUPABASE_ANON_KEY`), `GROQ_API_KEY`, `GROQ_MODEL`. See `backend/.env.example`. `GITHUB_TOKEN` is optional (increases rate limit from 60 to 5000 req/hr).
 - If adding scripts, define them in `backend/package.json` and run them from `backend/`.
 - Re-run `npm install` after changing `package.json` so `package-lock.json` stays in sync.
 - Do not add a frontend stack until the team chooses one.
 - Keep secrets out of source control and the frontend. Use environment configuration for tokens and service credentials; document required variable names without committing values.
 - The Supabase MCP is read-only. Use normal application credentials and migrations or SQL under an explicitly authorized workflow for writes/schema changes; never assume the MCP can perform them.
-- Tests: `backend/src/jobPostings.test.js` uses Node's built-in `node:test` with mocked Groq and Supabase. Run with `npm test` from `backend/`.
+- Tests: `backend/src/jobPostings.test.js` and `backend/src/repositories.test.js` use Node's built-in `node:test` with mocked dependencies. `backend/src/chunking-embedding.test.js` contains focused Feature 5 checks (17 tests). Run all with `npm test` from `backend/`. Total: 32 tests, all passing.
 
 ## Embedding model
 
-Chosen: **`Xenova/all-MiniLM-L6-v2`** (Hugging Face), **384 dimensions**. Runs in Node.js via the already-installed `@huggingface/transformers`. Record `embedding_model` and `embedding_dimensions` per chunk in `code_chunks` so a future model swap is detectable by query.
+Chosen: **`jinaai/jina-embeddings-v2-base-code`** (Hugging Face), **768 dimensions**. Runs in Node.js via the already-installed `@huggingface/transformers`. The model is loaded lazily on first ingest call and cached as a singleton for the lifetime of the server process. Mean pooling and L2 normalization are applied; embeddings are verified to be exactly 768-dimensional before any Supabase write. Record `embedding_model` and `embedding_dimensions` per chunk in `code_chunks` so a future model swap is detectable by query. First load downloads ~350 MB; subsequent runs use the `@huggingface/transformers` local cache.
+
+## Chunking strategy
+
+Line-based, deterministic, implemented in `backend/src/services/chunkingService.js`.
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `chunkSize` | 60 lines | Lines per chunk |
+| `overlap` | 10 lines | Lines shared with the next chunk (step = chunkSize − overlap = 50) |
+| Max file size | 100 KB | Files larger than this are skipped during GitHub fetch |
+| Max file count | 300 files | Per ingest call |
+| Max total bytes | 5 MB | Across all files per ingest call |
+
+- Each chunk carries `file_path`, `chunk_index` (0-indexed, reset per file), `start_line`/`end_line` (1-indexed, inclusive), `commit_sha`, and `blob_sha`.
+- Pure-whitespace chunks are skipped.
+- Same file + same commit SHA always produces the same chunk sequence (deterministic).
+- Excluded from indexing: binary files, lockfiles, minified bundles, `node_modules/`, `dist/`, `build/`, and other generated directories (see `githubIngestionService.js` for the full exclusion lists).
 
 ## LLM model
 
@@ -80,7 +103,6 @@ Chosen: **Groq** with **`qwen/qwen3.8-27b`** (configured via `GROQ_MODEL` env va
 
 ## Still to decide
 
-- Chunking strategy (size, overlap, which file types to include/exclude).
 - Polling interval and how the poller is hosted/run during the demo.
 - The frontend framework and visualization of evidence.
 
