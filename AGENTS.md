@@ -129,6 +129,7 @@ match_code_chunks(
 Chosen: **Groq** with **`qwen/qwen3.8-27b`** (configured via `GROQ_MODEL` env var). Confirmed supported for this account via `GET /test/groq/models`. Record `model_name` per assessment in `assessments` table. To change models, update `GROQ_MODEL` in `.env` and restart the server.
 
 - The account is on Groq's **on-demand tier**, which is tightly rate-limited for this model (observed: `7000` input tokens/minute and `1000` output tokens/minute per request). Prompts must stay under those ceilings — see the assessment section for how requests are bounded.
+- **Every Groq call must send an explicit `max_tokens`.** The OTPM limit is enforced as a *pre-flight* check on the request's expected output, so a request without `max_tokens` is rejected up front even when little has been generated: `429 rate_limit_exceeded ... OTPM: Limit 1000, Requested 1592. The request's expected output tokens exceed the enforced limit`. This is deterministic, so the SDK's built-in retry does not help. Requirement extraction sends `max_tokens: 900` (`RequirementExtractionService.maxOutputTokens`); assessment sends `min(999, batchSize × 200 + 150)`. Both are constructor options — tune them if the tier limit changes.
 - `qwen/qwen3.8-27b` supports JSON mode (`response_format: { type: "json_object" }`), which is used by both requirement extraction and assessment.
 
 ## Requirement assessment (Feature 7)
