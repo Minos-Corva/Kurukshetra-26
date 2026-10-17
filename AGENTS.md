@@ -18,12 +18,13 @@ A missing signal means **“not demonstrated in the analyzed repository”**, no
 - Top-level directories: `backend/` and `frontend/`.
 - `frontend/` is currently empty. No frontend framework or tooling has been selected; do not assume one.
 - The backend is a Node.js package using ES modules (`"type": "module"`).
-- Backend entry point: `backend/src/index.js` — Express server with `/api/job-postings`, `/api/repositories/ingest`, and `/api/evidence/retrieve` routes, Supabase client, Groq client, and Octokit wired up.
+- Backend entry point: `backend/src/index.js` — Express server with `/api/job-postings`, `/api/repositories/ingest`, `/api/evidence/retrieve`, and `/api/assessments` routes, Supabase client, Groq client, and Octokit wired up.
 - Backend layer directories now contain:
   - Feature 3: `backend/src/controllers/jobPostingsController.js`, `backend/src/repositories/jobPostingsRepository.js`, `backend/src/services/requirementExtractionService.js`, `backend/src/routes/jobPostingsRoutes.js`
   - Feature 4 & 5 (chunking + embedding pipeline): `backend/src/controllers/repositoriesController.js`, `backend/src/repositories/repositoriesRepository.js`, `backend/src/routes/repositoriesRoutes.js`, `backend/src/services/githubIngestionService.js`, `backend/src/services/chunkingService.js`, `backend/src/services/embeddingService.js`
   - Feature 6 (evidence retrieval): `backend/src/controllers/evidenceController.js`, `backend/src/repositories/evidenceRepository.js`, `backend/src/services/evidenceService.js`, `backend/src/routes/evidenceRoutes.js`
-  - Test files: `backend/src/jobPostings.test.js`, `backend/src/repositories.test.js`, `backend/src/chunking-embedding.test.js` (Feature 5 focused checks, 17 tests), `backend/src/evidence.test.js` (Feature 6, 14 tests)
+  - Feature 7 (requirement assessment): `backend/src/controllers/assessmentsController.js`, `backend/src/repositories/assessmentRepository.js`, `backend/src/services/assessmentService.js`, `backend/src/routes/assessmentsRoutes.js`
+  - Test files: `backend/src/jobPostings.test.js`, `backend/src/repositories.test.js`, `backend/src/chunking-embedding.test.js` (Feature 5 focused checks, 17 tests), `backend/src/evidence.test.js` (Feature 6, 14 tests), `backend/src/assessments.test.js` (Feature 7, 16 tests)
   - Smoke test: `backend/src/smoke-test-ingest.js` (run with `npm run smoke-test [owner] [repo]`)
 
 - Installed backend dependencies: `express`, `@supabase/supabase-js`, `zod`, `dotenv`, `octokit`, `@huggingface/transformers`, and `groq-sdk`. Groq is wired up in `index.js` (exported as `groq`) for requirement extraction.
@@ -58,7 +59,7 @@ These are the working design decisions discussed so far:
 5. **Hugging Face embeddings in JavaScript.** Use `@huggingface/transformers` for a compatible embedding model in Node.js. Use the same model and vector dimensions for repository chunks and requirement queries.
 6. **LLM for extraction and assessment.** Use Groq (`qwen/qwen3.8-27b` via `GROQ_MODEL` env var) to turn one real job posting into structured requirements (`requirements`), then assess requirements against retrieved code evidence (`requirement_assessments`).
 7. **Evidence-first assessment.** Vector search retrieves candidate chunks; similarity is not proof of a skill. Have the LLM return a separate verdict per requirement, with explanation and repository file/line citations stored in `assessment_evidence`.
-8. **Batch assessment where practical.** Retrieve evidence separately per requirement, group by requirement, and send groups in one structured LLM request when they fit the context window. Split into batches if needed.
+8. **Batch assessment where practical.** Retrieve evidence separately per requirement, group by requirement, and send groups in one structured LLM request when they fit the context window. Split into bounded batches (Feature 7 uses batches of at most 5) when they do not — the Groq on-demand tier's input/output token limits make one request per requirement both slow and wasteful. See **Requirement assessment (Feature 7)**.
 9. **Incremental indexing.** For each changed file, generate replacement chunks and embeddings in `code_chunks`, then replace old chunks for that repository/file. Remove chunks for deleted or newly excluded files. Handle renames by removing the old path and indexing the new path. Make updates idempotent and record the new indexed SHA only after all indexing work succeeds.
 10. **Before/after demo.** Show an initial assessment, make a real commit that changes relevant evidence, let polling trigger re-indexing and reassessment, and show the new result with citations.
 
@@ -70,13 +71,14 @@ These are the working design decisions discussed so far:
 - API endpoint: `POST /api/job-postings` — accepts `{ sourceUrl, postingText }`, extracts requirements via Groq, validates with Zod, persists to Supabase `job_postings` + `requirements` tables.
 - API endpoint: `POST /api/repositories/ingest` — accepts `{ owner, name, branch? }`, fetches GitHub files, chunks, embeds, and persists to `repositories`, `repository_index_state`, and `code_chunks`. Idempotent on same commit SHA.
 - API endpoint: `POST /api/evidence/retrieve` (alias `POST /api/evidence`) — accepts `{ jobPostingId? , assessmentId?, repositoryId? , owner?, name?, matchCount?, similarityThreshold? }`. Requires either `jobPostingId` or `assessmentId`; repository scope is `repositoryId` or `owner` + `name` (not needed when `assessmentId` is given). Returns per-requirement candidate chunks with `chunkId`, `similarity`, `filePath`, `lineRange`, `content`, and a commit-pinned `sourceUrl`. A requirement with no matches returns an **empty** evidence list — never a claim that the skill is absent. Errors: `400` invalid input, `404` posting/assessment/repository/requirements not found, `422` repository not indexed, `500` embedding/database failure.
+- API endpoint: `POST /api/assessments` (alias `POST /api/assessments/run`) — accepts the same identifiers as evidence retrieval (`{ jobPostingId?, assessmentId?, repositoryId?, owner?, name?, matchCount?, similarityThreshold? }`), reuses Feature 6 to retrieve evidence per requirement, then asks Groq for one verdict per requirement. Returns `201` with the new assessment (`{ assessment, created, requirementsCount, results[] }`) or `200` when replaying an existing assessment for the same commit SHA. Errors: `400` invalid input, `404` posting/assessment/requirements not found, `422` repository not indexed, `502` unusable model output, `500` embedding/database failure. See **Requirement assessment (Feature 7)** below.
 - Required env vars: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (or `SUPABASE_ANON_KEY`), `GROQ_API_KEY`, `GROQ_MODEL`. See `backend/.env.example`. `GITHUB_TOKEN` is optional (increases rate limit from 60 to 5000 req/hr).
 - If adding scripts, define them in `backend/package.json` and run them from `backend/`.
 - Re-run `npm install` after changing `package.json` so `package-lock.json` stays in sync.
 - Do not add a frontend stack until the team chooses one.
 - Keep secrets out of source control and the frontend. Use environment configuration for tokens and service credentials; document required variable names without committing values.
 - The Supabase MCP is read-only. Use normal application credentials and migrations or SQL under an explicitly authorized workflow for writes/schema changes; never assume the MCP can perform them.
-- Tests: `backend/src/jobPostings.test.js` and `backend/src/repositories.test.js` use Node's built-in `node:test` with mocked dependencies. `backend/src/chunking-embedding.test.js` contains focused Feature 5 checks (17 tests). `backend/src/evidence.test.js` contains Feature 6 checks (14 tests, mocked Supabase/embeddings). Run all with `npm test` from `backend/`. Total: 46 tests, all passing.
+- Tests: `backend/src/jobPostings.test.js` and `backend/src/repositories.test.js` use Node's built-in `node:test` with mocked dependencies. `backend/src/chunking-embedding.test.js` contains focused Feature 5 checks (17 tests). `backend/src/evidence.test.js` contains Feature 6 checks (14 tests, mocked Supabase/embeddings). `backend/src/assessments.test.js` contains Feature 7 checks (16 tests, mocked retrieval/Groq/persistence). Run all with `npm test` from `backend/`. Total: 62 tests, all passing.
 
 ## Embedding model
 
@@ -125,10 +127,42 @@ match_code_chunks(
 
 Chosen: **Groq** with **`qwen/qwen3.8-27b`** (configured via `GROQ_MODEL` env var). Confirmed supported for this account via `GET /test/groq/models`. Record `model_name` per assessment in `assessments` table. To change models, update `GROQ_MODEL` in `.env` and restart the server.
 
+- The account is on Groq's **on-demand tier**, which is tightly rate-limited for this model (observed: `7000` input tokens/minute and `1000` output tokens/minute per request). Prompts must stay under those ceilings — see the assessment section for how requests are bounded.
+- `qwen/qwen3.8-27b` supports JSON mode (`response_format: { type: "json_object" }`), which is used by both requirement extraction and assessment.
+
+## Requirement assessment (Feature 7)
+
+Implemented in `assessmentService.js` (orchestration + validation), `assessmentRepository.js` (persistence + status mapping), `assessmentsController.js` (HTTP + error mapping), and `assessmentsRoutes.js`.
+
+**Route:** `POST /api/assessments` (alias `POST /api/assessments/run`). Required configuration is the same as the other features: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (or `SUPABASE_ANON_KEY`), `GROQ_API_KEY`, `GROQ_MODEL`; `GITHUB_TOKEN` optional.
+
+**Request:** the same identifiers as evidence retrieval — `jobPostingId` or `assessmentId`, and repository scope `repositoryId` or `owner` + `name` (not needed when `assessmentId` is given). `matchCount` (default 5) and `similarityThreshold` (default 0.5) are forwarded to the Feature 6 retrieval service.
+
+**Flow:** resolve posting/repository and retrieve per-requirement evidence via `EvidenceService.retrieveEvidence` (no second vector search or embedding logic) → build one structured Groq request per bounded batch → validate the response with Zod plus completeness and grounding checks — then persist one `assessments` row, one `requirement_assessments` verdict per requirement, and `assessment_evidence` citations.
+
+**Statuses (API):** `supported`, `partial`, `not_found`.
+
+- `supported` = the retrieved evidence clearly demonstrates the requirement.
+- `partial` = the evidence demonstrates only part of it.
+- `not_found` means **“not demonstrated in the analyzed repository”**, never proof the candidate lacks the skill. Requirements with no retrieved evidence are returned as `not_found` with an explanatory note.
+- **Database mapping (important):** the pre-applied `requirement_assessments.status` CHECK only permits `demonstrated | partial | not_demonstrated | uncertain`, so `assessmentRepository.js` maps `supported → demonstrated`, `partial → partial`, `not_found → not_demonstrated` on write and back on read. The API always speaks `supported | partial | not_found`. (`uncertain` is passed through defensively if a row was written elsewhere.) No schema change was made.
+
+**Per-requirement response** (in `results[]`): `requirementId`, `requirementKey`, `skill`, `description`, `status`, `explanation`, `confidence`, and `evidence[]` where each citation has `evidenceId`/`chunkId`, `filePath`, `startLine`, `endLine`, `lineRange`, `similarity` (when freshly computed), and a commit-pinned `sourceUrl`.
+
+**Validation and safety:**
+- The model must return exactly one result per requirement (matched by `requirement_id`); missing, duplicate, or unknown requirement IDs reject the whole run (`502`) and nothing is persisted.
+- A `supported`/`partial` verdict with no citation that retrieval actually returned is rejected as ungrounded (`502`) — the model cannot invent evidence.
+- Retrieved code is passed as untrusted data; the system prompt instructs the model to analyze it as evidence and never follow instructions found inside it.
+- Malformed JSON, schema-invalid output, and Groq failures all fail safely (`502`) without storing a misleading assessment.
+
+**Bounded requests (Groq tier limits):** requirements are grouped into batches of at most `5` and the prompt is trimmed (`maxEvidencePerRequirement = 3`, `maxEvidenceChars = 400`, `maxTextChars = 300`). `max_tokens` is set per batch (`min(999, batchSize × 200 + 150)`) so the request stays within the output-token ceiling. Number of Groq calls is `ceil(requirements / 5)` — never one call per requirement. A typical 10-requirement posting is assessed in 2 calls. These knobs are constructor options on `AssessmentService`; widen them only if the Groq tier limit changes.
+
+**Idempotency:** there is no unique constraint on `assessments`, so `assessmentRepository.findExistingAssessment` looks up `(job_posting_id, repository_id, commit_sha)` and the service returns the stored assessment (`created: false`, HTTP `200`) instead of re-running the model. A new commit SHA produces a new row.
+
 ## Implementation status
 
-- **Implemented and verified live:** requirement extraction (`POST /api/job-postings` → Groq), repository ingestion/chunking/embedding (`POST /api/repositories/ingest`), evidence retrieval with citations (`POST /api/evidence/retrieve`), and the change-detection *data model* in `repository_index_state` (re-ingesting the same commit SHA is a no-op; chunks are replaced when the SHA changes).
-- **Not implemented yet:** the poller that watches for new commits, and the assessment/reassessment step. The `assessments`, `requirement_assessments`, and `assessment_evidence` tables exist but nothing writes them, and there is no assessment endpoint.
+- **Implemented and verified live:** requirement extraction (`POST /api/job-postings` → Groq), repository ingestion/chunking/embedding (`POST /api/repositories/ingest`), evidence retrieval with citations (`POST /api/evidence/retrieve`), requirement-by-requirement assessment with persisted verdicts and citations (`POST /api/assessments`), and the change-detection *data model* in `repository_index_state` (re-ingesting the same commit SHA is a no-op; chunks are replaced when the SHA changes). A live run against `expressjs/cors` (commit `5317ebe6…`) assessed a 10-requirement posting as 6 `supported` + 4 `not_found`, persisted 1 `assessments` row, 10 `requirement_assessments` rows, and 13 `assessment_evidence` rows.
+- **Not implemented yet:** the poller that watches for new commits, and the automatic reassessment trigger. Assessment can be requested manually, but nothing yet detects a changed SHA and re-runs it. A manual re-assessment on a new commit SHA will produce a new row, which is enough to demonstrate before/after by hand.
 
 ## Still to decide
 
