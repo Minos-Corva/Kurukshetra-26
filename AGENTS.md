@@ -162,26 +162,33 @@ Implemented in `assessmentService.js` (orchestration + validation), `assessmentR
 
 **Idempotency:** there is no unique constraint on `assessments`, so `assessmentRepository.findExistingAssessment` looks up `(job_posting_id, repository_id, commit_sha)` and the service returns the stored assessment (`created: false`, HTTP `200`) instead of re-running the model. A new commit SHA produces a new row.
 
-## Frontend (Feature 8)
+## Frontend (React & Tailwind CSS Demo UI)
 
-The UI is plain HTML/CSS/JavaScript with **no framework, no build step, and no dependencies**. It calls only the existing backend API; it never calls Groq or vector search, and it never decides a status — it displays the assessment exactly as the backend returned it.
+The demo UI is built with **React 19**, **Vite 8**, and **Tailwind CSS v4** (located in `frontend-src/`), and compiles to static assets in `frontend/`, which the backend Express server serves at `/app/`. It calls only the existing backend API routes, keeping backend credentials and LLM logic strictly on the server.
 
-- `frontend/index.html` — the flow (job posting → repository → assess → results), a "Flow status" panel, and a status legend.
-- `frontend/styles.css` — dependency-free styles; responsive single-column layout, `prefers-color-scheme` support, and status indicators that pair a text label with a symbol (never color alone).
-- `frontend/app.js` — API client and rendering. Builds DOM with `textContent` only (no `innerHTML`), so untrusted model text cannot inject markup.
-- `frontend/config.js` — runtime config: `window.__KURUKSHETRA_CONFIG__ = { API_BASE_URL: "" }`. Empty means "the origin that served the page". Never put secrets here.
+- `frontend-src/src/App.jsx` — single-page flow with steps: Job Posting, Repository Ingestion, Assessment Execution, Results Display, and Polling / Flow status.
+- `frontend-src/src/components/JobPostingStep.jsx` — job posting input, sample loader, manual posting ID input, and extracted requirements badge list.
+- `frontend-src/src/components/RepositoryStep.jsx` — owner/repo/branch inputs, sample repository shortcuts, indexing status, confirmed commit SHA, and chunk metrics.
+- `frontend-src/src/components/AssessmentStep.jsx` — match count and similarity threshold controls, execution trigger, and progress indicator.
+- `frontend-src/src/components/AssessmentResults.jsx` — requirement breakdown cards (supported / partial / not_found), confidence score bars, and citations with commit-pinned GitHub lines links.
+- `frontend-src/src/components/FlowStatus.jsx` — pipeline state summary and quick links.
+- `frontend-src/src/api.js` — type-safe API client wrapper calling `/api/job-postings`, `/api/repositories/ingest`, `/api/assessments`, and health check.
+- `frontend-src/src/index.css` — modern glassmorphism styling, dark mode, custom scrollbars, and accessible focus outlines.
 
-**Serving:** `backend/src/index.js` mounts `express.static` at `/app` (directory from the optional `FRONTEND_DIR` env var, default `../frontend`). Open `http://localhost:3000/app/`. Same-origin means no CORS middleware is needed and none was added; `GET /` still returns JSON.
+**Serving:** `backend/src/index.js` mounts `express.static` at `/app` (directory from `FRONTEND_DIR` env var, default `../frontend`). Open `http://localhost:3000/app/`. Same-origin means no CORS configuration is needed.
 
-**Endpoints used (all pre-existing):** `POST /api/job-postings`, `POST /api/repositories/ingest`, `POST /api/assessments`. No API route was added or changed.
+**Building:**
+- Run `npm run build` from `frontend-src/` to compile JSX and CSS into `frontend/`.
+- During development, `npm run dev` in `frontend-src/` runs Vite with proxying to backend `http://localhost:3000`.
 
-**Confirmed behavior (verified in a browser against the live backend):**
+**Endpoints used:** `POST /api/job-postings`, `POST /api/repositories/ingest`, `POST /api/assessments`. No API route was added or changed.
+
+**Confirmed behavior:**
 - Submitting a posting stores `posting.id` and lists the extracted requirements. The requirement list is not re-fetchable because there is **no `GET` endpoint** for job postings; the UI offers "Use an existing posting ID" (UUID) instead.
-- Indexing shows `repository.id`, `indexedCommitSha`, `fileCount`, `chunkCount`, and `status`, and can be run again safely (idempotent). There is **no endpoint that reports index status on its own**, so status comes from the ingest response.
+- Indexing shows `repository.id`, `indexedCommitSha`, `fileCount`, `chunkCount`, and `status`, and can be run again safely (idempotent).
 - Assess stays disabled until a posting ID and a repository scope (`repositoryId`, or `owner` + `name`) are present. Progress is shown while a request runs, and inputs are preserved after an error.
-- Results render one card per requirement: skill, description, status badge (`supported` / `partial` / `not_found`, plus a defensive `uncertain`), explanation, confidence, and evidence with `filePath`, `lineRange`, repository, and a commit-pinned GitHub `sourceUrl`. "Not found" cards state that this means **not demonstrated in the analyzed repository**, and cards with no evidence show an explicit empty message.
+- Results render one card per requirement: skill, description, status badge (`supported` / `partial` / `not_found`), explanation, confidence, and evidence with `filePath`, `lineRange`, repository, and a commit-pinned GitHub `sourceUrl`. "Not found" cards state that this means **not demonstrated in the analyzed repository**, and cards with no evidence show an explicit empty message.
 - API errors surface only the backend's sanitized `error` / `message` / `details` — never raw response text.
-- `GET /app/` scores 1.0 for Lighthouse accessibility, best practices, and SEO, both on load and with a full assessment rendered.
 
 ## GitHub commit polling and incremental repository updates (Feature 9)
 
@@ -234,7 +241,7 @@ Implemented in `backend/src/services/pollingService.js`, `backend/src/poll-repos
 
 - Hosting and deployment model for long-running poller in production (e.g., background daemon process in container, external cron/scheduled task calling `npm run poll`, or serverless scheduled invocation via protected `POST /api/polling/run`).
 - Automatic reassessment strategy: whether a commit advancement should immediately trigger an LLM reassessment run in the background or flag the repository as "update available" for user-triggered reassessment.
-- Frontend framework: **decided** — dependency-free vanilla HTML/CSS/JS served at `/app` (see **Frontend (Feature 8)**). Revisit only if the team wants a framework and a build step.
+- Frontend framework: **decided** — React 19 + Tailwind CSS v4 in `frontend-src/`, compiled with Vite to static assets in `frontend/`, served by the Express backend at `/app/`. No separate web server is required in production.
 - Further UI work (not started): a picker for existing postings/repositories/assessments, which needs new `GET` endpoints; and richer evidence display (code excerpts / diff view) beyond the current file + line-range links.
 
 Prefer the smallest implementation that proves the complete change-detection and reassessment loop. Optional resume editing, career research, learning plans, and multi-repository support are outside the initial MVP unless the team explicitly expands scope.
