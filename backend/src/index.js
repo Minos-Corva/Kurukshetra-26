@@ -13,6 +13,10 @@ import { GithubIngestionService } from "./services/githubIngestionService.js";
 import { ChunkingService } from "./services/chunkingService.js";
 import { EmbeddingService } from "./services/embeddingService.js";
 import { RepositoriesController } from "./controllers/repositoriesController.js";
+import { EvidenceRepository } from "./repositories/evidenceRepository.js";
+import { EvidenceService } from "./services/evidenceService.js";
+import { EvidenceController } from "./controllers/evidenceController.js";
+import { createEvidenceRoutes } from "./routes/evidenceRoutes.js";
 
 dotenv.config();
 
@@ -66,8 +70,18 @@ const repositoriesController = new RepositoriesController({
   repository: repositoriesRepo,
 });
 
+const evidenceRepo = new EvidenceRepository({ supabaseClient: supabase });
+const evidenceService = new EvidenceService({
+  embeddingService,
+  repository: evidenceRepo,
+});
+const evidenceController = new EvidenceController({
+  evidenceService,
+});
+
 app.use("/api", createJobPostingsRoutes({ controller }));
 app.use("/api", createRepositoriesRoutes({ controller: repositoriesController }));
+app.use("/api", createEvidenceRoutes({ controller: evidenceController }));
 
 app.get("/", (_req, res) => {
   res.json({ name: "W-PS-2 AI Career Coach", status: "ok" });
