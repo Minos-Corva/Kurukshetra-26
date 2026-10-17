@@ -153,7 +153,15 @@ async function main() {
 
   let embeddingOk = true;
   for (const c of chunks) {
-    const vec = c.embedding;
+    // PostgREST returns a pgvector column as a string like "[0.1,0.2,...]".
+    let vec = c.embedding;
+    if (typeof vec === "string") {
+      try {
+        vec = JSON.parse(vec);
+      } catch {
+        vec = vec.replace(/^\[|\]$/g, "").split(",").map((n) => Number(n.trim()));
+      }
+    }
     if (!Array.isArray(vec)) {
       fail(`Chunk ${c.file_path}: embedding is not an array (got ${typeof vec})`);
       embeddingOk = false;
