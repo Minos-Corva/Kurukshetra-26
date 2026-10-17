@@ -66,8 +66,8 @@ These are the working design decisions discussed so far:
 
 ## Repository and command guidance
 
-- Before running or adding commands, inspect `backend/package.json`. Available scripts: `npm run dev` / `npm start` (run `backend/src/index.js`), `npm test` (runs `node --test`), `npm run smoke-test [owner] [repo]` (manual ingest smoke test, requires a running server).
-- Run the server from `backend/` with `npm run dev`.
+- Before running or adding commands, inspect `backend/package.json`. Available scripts: `npm run dev` (runs `backend/src/index.js` with `node --watch`, so backend source edits restart the server automatically), `npm start` (runs `backend/src/index.js` once, no watcher), `npm test` (runs `node --test`), `npm run smoke-test [owner] [repo]` (manual ingest smoke test, requires a running server).
+- Run the server from `backend/` with `npm run dev`. Because it uses `node --watch`, editing a backend source file restarts the process, so `/app/` stays in sync with the checkout. A server started with `npm start` (or from an older checkout) must be restarted by hand, otherwise it can 404 on `/app/` even though the current `index.js` mounts it.
 - Test routes: `GET /` (status; now also reports `ui: "/app/"`), `GET /health` (Supabase reachability), `GET /test/groq` (Groq client configured?), `GET /test/groq/models` (list available Groq models and verify key). `GET /app/` serves the Feature 8 static UI from the same origin.
 - API endpoint: `POST /api/job-postings` — accepts `{ sourceUrl, postingText }`, extracts requirements via Groq, validates with Zod, persists to Supabase `job_postings` + `requirements` tables.
 - API endpoint: `POST /api/repositories/ingest` — accepts `{ owner, name, branch? }`, fetches GitHub files, chunks, embeds, and persists to `repositories`, `repository_index_state`, and `code_chunks`. Idempotent on same commit SHA.
