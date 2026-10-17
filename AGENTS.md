@@ -16,7 +16,7 @@ A missing signal means **“not demonstrated in the analyzed repository”**, no
 
 - Git is initialized. The default branch is `main`; feature work happens on branches (for example `feature-evidance-retrival`).
 - Top-level directories: `backend/` and `frontend/`.
-- `frontend/` is currently empty. No frontend framework or tooling has been selected; do not assume one.
+- `frontend/` contains the Feature 8 assessment UI: plain HTML/CSS/JavaScript (ES modules) with **no framework, no build step, and no dependencies**. Files: `frontend/index.html`, `frontend/styles.css`, `frontend/app.js`, `frontend/config.js`. There is no frontend `package.json`, no test runner, and no lint/format config.
 - The backend is a Node.js package using ES modules (`"type": "module"`).
 - Backend entry point: `backend/src/index.js` — Express server with `/api/job-postings`, `/api/repositories/ingest`, `/api/evidence/retrieve`, and `/api/assessments` routes, Supabase client, Groq client, and Octokit wired up.
 - Backend layer directories now contain:
@@ -24,6 +24,7 @@ A missing signal means **“not demonstrated in the analyzed repository”**, no
   - Feature 4 & 5 (chunking + embedding pipeline): `backend/src/controllers/repositoriesController.js`, `backend/src/repositories/repositoriesRepository.js`, `backend/src/routes/repositoriesRoutes.js`, `backend/src/services/githubIngestionService.js`, `backend/src/services/chunkingService.js`, `backend/src/services/embeddingService.js`
   - Feature 6 (evidence retrieval): `backend/src/controllers/evidenceController.js`, `backend/src/repositories/evidenceRepository.js`, `backend/src/services/evidenceService.js`, `backend/src/routes/evidenceRoutes.js`
   - Feature 7 (requirement assessment): `backend/src/controllers/assessmentsController.js`, `backend/src/repositories/assessmentRepository.js`, `backend/src/services/assessmentService.js`, `backend/src/routes/assessmentsRoutes.js`
+  - Feature 8 (assessment display UI): `frontend/index.html`, `frontend/styles.css`, `frontend/app.js`, `frontend/config.js` (no backend modules added; `backend/src/index.js` gained a static mount only)
   - Test files: `backend/src/jobPostings.test.js`, `backend/src/repositories.test.js`, `backend/src/chunking-embedding.test.js` (Feature 5 focused checks, 17 tests), `backend/src/evidence.test.js` (Feature 6, 14 tests), `backend/src/assessments.test.js` (Feature 7, 16 tests)
   - Smoke test: `backend/src/smoke-test-ingest.js` (run with `npm run smoke-test [owner] [repo]`)
 
@@ -67,7 +68,7 @@ These are the working design decisions discussed so far:
 
 - Before running or adding commands, inspect `backend/package.json`. Available scripts: `npm run dev` / `npm start` (run `backend/src/index.js`), `npm test` (runs `node --test`), `npm run smoke-test [owner] [repo]` (manual ingest smoke test, requires a running server).
 - Run the server from `backend/` with `npm run dev`.
-- Test routes: `GET /` (status), `GET /health` (Supabase reachability), `GET /test/groq` (Groq client configured?), `GET /test/groq/models` (list available Groq models and verify key).
+- Test routes: `GET /` (status; now also reports `ui: "/app/"`), `GET /health` (Supabase reachability), `GET /test/groq` (Groq client configured?), `GET /test/groq/models` (list available Groq models and verify key). `GET /app/` serves the Feature 8 static UI from the same origin.
 - API endpoint: `POST /api/job-postings` — accepts `{ sourceUrl, postingText }`, extracts requirements via Groq, validates with Zod, persists to Supabase `job_postings` + `requirements` tables.
 - API endpoint: `POST /api/repositories/ingest` — accepts `{ owner, name, branch? }`, fetches GitHub files, chunks, embeds, and persists to `repositories`, `repository_index_state`, and `code_chunks`. Idempotent on same commit SHA.
 - API endpoint: `POST /api/evidence/retrieve` (alias `POST /api/evidence`) — accepts `{ jobPostingId? , assessmentId?, repositoryId? , owner?, name?, matchCount?, similarityThreshold? }`. Requires either `jobPostingId` or `assessmentId`; repository scope is `repositoryId` or `owner` + `name` (not needed when `assessmentId` is given). Returns per-requirement candidate chunks with `chunkId`, `similarity`, `filePath`, `lineRange`, `content`, and a commit-pinned `sourceUrl`. A requirement with no matches returns an **empty** evidence list — never a claim that the skill is absent. Errors: `400` invalid input, `404` posting/assessment/repository/requirements not found, `422` repository not indexed, `500` embedding/database failure.
@@ -75,8 +76,8 @@ These are the working design decisions discussed so far:
 - Required env vars: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (or `SUPABASE_ANON_KEY`), `GROQ_API_KEY`, `GROQ_MODEL`. See `backend/.env.example`. `GITHUB_TOKEN` is optional (increases rate limit from 60 to 5000 req/hr).
 - If adding scripts, define them in `backend/package.json` and run them from `backend/`.
 - Re-run `npm install` after changing `package.json` so `package-lock.json` stays in sync.
-- Do not add a frontend stack until the team chooses one.
-- Keep secrets out of source control and the frontend. Use environment configuration for tokens and service credentials; document required variable names without committing values.
+- Do not add a frontend build tool, framework, or package manager without a team decision. Feature 8 is intentionally dependency-free and served by the existing Express server (see **Frontend (Feature 8)**).
+- Keep secrets out of source control and the frontend. Use environment configuration for tokens and service credentials; document required variable names without committing values. The browser only talks to the backend API; it never holds Supabase, Groq, or GitHub credentials.
 - The Supabase MCP is read-only. Use normal application credentials and migrations or SQL under an explicitly authorized workflow for writes/schema changes; never assume the MCP can perform them.
 - Tests: `backend/src/jobPostings.test.js` and `backend/src/repositories.test.js` use Node's built-in `node:test` with mocked dependencies. `backend/src/chunking-embedding.test.js` contains focused Feature 5 checks (17 tests). `backend/src/evidence.test.js` contains Feature 6 checks (14 tests, mocked Supabase/embeddings). `backend/src/assessments.test.js` contains Feature 7 checks (16 tests, mocked retrieval/Groq/persistence). Run all with `npm test` from `backend/`. Total: 62 tests, all passing.
 
@@ -159,15 +160,41 @@ Implemented in `assessmentService.js` (orchestration + validation), `assessmentR
 
 **Idempotency:** there is no unique constraint on `assessments`, so `assessmentRepository.findExistingAssessment` looks up `(job_posting_id, repository_id, commit_sha)` and the service returns the stored assessment (`created: false`, HTTP `200`) instead of re-running the model. A new commit SHA produces a new row.
 
+## Frontend (Feature 8)
+
+The UI is plain HTML/CSS/JavaScript with **no framework, no build step, and no dependencies**. It calls only the existing backend API; it never calls Groq or vector search, and it never decides a status — it displays the assessment exactly as the backend returned it.
+
+- `frontend/index.html` — the flow (job posting → repository → assess → results), a "Flow status" panel, and a status legend.
+- `frontend/styles.css` — dependency-free styles; responsive single-column layout, `prefers-color-scheme` support, and status indicators that pair a text label with a symbol (never color alone).
+- `frontend/app.js` — API client and rendering. Builds DOM with `textContent` only (no `innerHTML`), so untrusted model text cannot inject markup.
+- `frontend/config.js` — runtime config: `window.__KURUKSHETRA_CONFIG__ = { API_BASE_URL: "" }`. Empty means "the origin that served the page". Never put secrets here.
+
+**Serving:** `backend/src/index.js` mounts `express.static` at `/app` (directory from the optional `FRONTEND_DIR` env var, default `../frontend`). Open `http://localhost:3000/app/`. Same-origin means no CORS middleware is needed and none was added; `GET /` still returns JSON.
+
+**Endpoints used (all pre-existing):** `POST /api/job-postings`, `POST /api/repositories/ingest`, `POST /api/assessments`. No API route was added or changed.
+
+**Confirmed behavior (verified in a browser against the live backend):**
+- Submitting a posting stores `posting.id` and lists the extracted requirements. The requirement list is not re-fetchable because there is **no `GET` endpoint** for job postings; the UI offers "Use an existing posting ID" (UUID) instead.
+- Indexing shows `repository.id`, `indexedCommitSha`, `fileCount`, `chunkCount`, and `status`, and can be run again safely (idempotent). There is **no endpoint that reports index status on its own**, so status comes from the ingest response.
+- Assess stays disabled until a posting ID and a repository scope (`repositoryId`, or `owner` + `name`) are present. Progress is shown while a request runs, and inputs are preserved after an error.
+- Results render one card per requirement: skill, description, status badge (`supported` / `partial` / `not_found`, plus a defensive `uncertain`), explanation, confidence, and evidence with `filePath`, `lineRange`, repository, and a commit-pinned GitHub `sourceUrl`. "Not found" cards state that this means **not demonstrated in the analyzed repository**, and cards with no evidence show an explicit empty message.
+- API errors surface only the backend's sanitized `error` / `message` / `details` — never raw response text.
+- `GET /app/` scores 1.0 for Lighthouse accessibility, best practices, and SEO, both on load and with a full assessment rendered.
+
+**Open gap:** there is no endpoint to list job postings, repositories, or past assessments, so the UI depends on IDs returned in the current session or entered by hand.
+
 ## Implementation status
 
 - **Implemented and verified live:** requirement extraction (`POST /api/job-postings` → Groq), repository ingestion/chunking/embedding (`POST /api/repositories/ingest`), evidence retrieval with citations (`POST /api/evidence/retrieve`), requirement-by-requirement assessment with persisted verdicts and citations (`POST /api/assessments`), and the change-detection *data model* in `repository_index_state` (re-ingesting the same commit SHA is a no-op; chunks are replaced when the SHA changes). A live run against `expressjs/cors` (commit `5317ebe6…`) assessed a 10-requirement posting as 6 `supported` + 4 `not_found`, persisted 1 `assessments` row, 10 `requirement_assessments` rows, and 13 `assessment_evidence` rows.
+- **Frontend verified:** the Feature 8 UI at `GET /app/` was driven end-to-end in a browser against the live backend (posting → index `expressjs/cors` → assess → 10 rendered requirement cards with 13 commit-pinned evidence links; a `422` unindexed-repository error and a preserved-input error path were also exercised). `GET /app/` scored 1.0 on Lighthouse accessibility, best practices, and SEO.
+- **Missing endpoints the UI works around:** there is no `GET` for job postings, repositories, or past assessments, and no endpoint that reads index status on its own. The UI therefore relies on IDs returned by the write endpoints (or manual entry) and on the ingest response for index status.
 - **Not implemented yet:** the poller that watches for new commits, and the automatic reassessment trigger. Assessment can be requested manually, but nothing yet detects a changed SHA and re-runs it. A manual re-assessment on a new commit SHA will produce a new row, which is enough to demonstrate before/after by hand.
 
 ## Still to decide
 
 - Polling interval and how the poller is hosted/run during the demo.
-- The frontend framework and visualization of evidence.
+- Frontend framework: **decided** — dependency-free vanilla HTML/CSS/JS served at `/app` (see **Frontend (Feature 8)**). Revisit only if the team wants a framework and a build step.
+- Further UI work (not started): a picker for existing postings/repositories/assessments, which needs new `GET` endpoints; and richer evidence display (code excerpts / diff view) beyond the current file + line-range links.
 
 
 Prefer the smallest implementation that proves the complete change-detection and reassessment loop. Optional resume editing, career research, learning plans, and multi-repository support are outside the initial MVP unless the team explicitly expands scope.

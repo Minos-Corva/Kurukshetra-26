@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI Career Coach — Requirement Assessment</title>
+    <meta
+      name="description"
+      content="Compare a job posting with evidence in a GitHub repository and see which requirements are demonstrated."
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to main content</a>
+
+    <header class="site-header">
+      <div class="wrap">
+        <h1>AI Career Coach</h1>
+        <p class="site-header__sub">
+          Compare a job posting with evidence in a GitHub repository, then see which
+          requirements are demonstrated — with citations back to the code.
+        </p>
+      </div>
+    </header>
+
+    <main id="main" class="wrap" tabindex="-1">
+      <noscript>
+        <p class="notice notice--error">
+          This UI needs JavaScript enabled to call the backend API.
+        </p>
+      </noscript>
+
+      <!-- Configuration warning (missing / invalid API base URL). -->
+      <div id="config-warning" class="notice notice--error" role="alert" hidden></div>
+
+      <!-- Flow status: which steps have completed in this session. -->
+      <section class="card" aria-labelledby="flow-heading">
+        <h2 id="flow-heading" class="card__title">Flow status</h2>
+        <p class="card__hint">Only steps the backend has confirmed are marked complete.</p>
+        <div role="status" aria-live="polite">
+          <ul id="flow-status" class="flow">
+            <li class="flow__item" data-step="posting">
+              <span class="flow__dot" aria-hidden="true"></span>
+              <span class="flow__label">1. Job posting saved</span>
+              <span class="flow__state" data-flow-state="posting">Not started</span>
+            </li>
+            <li class="flow__item" data-step="repository">
+              <span class="flow__dot" aria-hidden="true"></span>
+              <span class="flow__label">2. Repository indexed</span>
+              <span class="flow__state" data-flow-state="repository">Not started</span>
+            </li>
+            <li class="flow__item" data-step="assessment">
+              <span class="flow__dot" aria-hidden="true"></span>
+              <span class="flow__label">3. Assessment completed</span>
+              <span class="flow__state" data-flow-state="assessment">Not started</span>
+            </li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- Step 1: job posting -->
+      <section class="card" aria-labelledby="posting-heading">
+        <h2 id="posting-heading" class="card__title">1. Job posting</h2>
+        <p class="card__hint">
+          Submitting a posting extracts structured requirements with the backend LLM.
+          The API has no listing endpoint, so this page keeps the returned posting ID.
+        </p>
+
+        <form id="posting-form" novalidate>
+          <div class="field">
+            <label for="source-url">Posting URL (https)</label>
+            <input
+              id="source-url"
+              name="sourceUrl"
+              type="url"
+              inputmode="url"
+              autocomplete="url"
+              placeholder="https://example.com/jobs/backend-intern"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="posting-text">Posting text</label>
+            <textarea
+              id="posting-text"
+              name="postingText"
+              rows="8"
+              placeholder="Paste the full job or internship description here."
+              required
+            ></textarea>
+          </div>
+
+          <div class="actions">
+            <button id="posting-submit" type="submit" class="btn btn--primary">
+              Extract requirements &amp; save
+            </button>
+            <span id="posting-progress" class="progress" role="status" aria-live="polite"></span>
+          </div>
+        </form>
+
+        <div id="posting-error" class="notice notice--error" role="alert" hidden></div>
+
+        <details class="existing">
+          <summary>Use an existing posting ID</summary>
+          <div class="field">
+            <label for="existing-posting-id">Job posting UUID</label>
+            <input
+              id="existing-posting-id"
+              type="text"
+              spellcheck="false"
+              placeholder="00000000-0000-0000-0000-000000000000"
+            />
+          </div>
+          <div class="actions">
+            <button id="use-posting-btn" type="button" class="btn">Use this posting ID</button>
+          </div>
+        </details>
+
+        <div id="posting-result" class="result" hidden></div>
+      </section>
+
+      <!-- Step 2: repository -->
+      <section class="card" aria-labelledby="repo-heading">
+        <h2 id="repo-heading" class="card__title">2. Repository</h2>
+        <p class="card__hint">
+          Indexing fetches the repository, chunks it, and stores embeddings. Re-running
+          is safe: the backend is idempotent and skips work when the commit is unchanged.
+        </p>
+
+        <form id="repo-form" novalidate>
+          <div class="grid-2">
+            <div class="field">
+              <label for="repo-owner">Owner</label>
+              <input id="repo-owner" name="owner" type="text" spellcheck="false" placeholder="expressjs" required />
+            </div>
+            <div class="field">
+              <label for="repo-name">Repository name</label>
+              <input id="repo-name" name="name" type="text" spellcheck="false" placeholder="cors" required />
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="repo-branch">Branch (optional)</label>
+            <input id="repo-branch" name="branch" type="text" spellcheck="false" placeholder="Default branch" />
+          </div>
+
+          <div class="actions">
+            <button id="repo-submit" type="submit" class="btn btn--primary">
+              Index / refresh repository
+            </button>
+            <span id="repo-progress" class="progress" role="status" aria-live="polite"></span>
+          </div>
+        </form>
+
+        <div id="repo-error" class="notice notice--error" role="alert" hidden></div>
+
+        <div id="repo-result" class="result" hidden></div>
+      </section>
+
+      <!-- Step 3: assess -->
+      <section class="card" aria-labelledby="assess-heading">
+        <h2 id="assess-heading" class="card__title">3. Assess requirements</h2>
+        <p class="card__hint">
+          Runs evidence retrieval for every requirement, then asks the backend model for a
+          verdict per requirement. Repeating this for the same commit returns the stored
+          assessment instead of re-running the model.
+        </p>
+
+        <form id="assess-form" novalidate>
+          <div class="grid-2">
+            <div class="field">
+              <label for="match-count">Evidence chunks per requirement</label>
+              <input id="match-count" name="matchCount" type="number" min="1" max="50" step="1" value="5" />
+            </div>
+            <div class="field">
+              <label for="similarity-threshold">Similarity threshold (0–1)</label>
+              <input
+                id="similarity-threshold"
+                name="similarityThreshold"
+                type="number"
+                min="0"
+                max="1"
+                step="0.05"
+                value="0.5"
+              />
+            </div>
+          </div>
+
+          <div class="actions">
+            <button id="assess-submit" type="submit" class="btn btn--primary" disabled>
+              Assess requirements
+            </button>
+            <span id="assess-progress" class="progress" role="status" aria-live="polite"></span>
+          </div>
+          <p id="assess-requirement" class="card__hint" data-assess-hint>
+            Save a job posting and index a repository first.
+          </p>
+        </form>
+
+        <div id="assess-error" class="notice notice--error" role="alert" hidden></div>
+      </section>
+
+      <!-- Results -->
+      <section id="results-section" class="card" aria-labelledby="results-heading" hidden>
+        <h2 id="results-heading" class="card__title">Assessment results</h2>
+        <div id="results-summary" class="summary"></div>
+        <div id="results-list" class="results"></div>
+      </section>
+
+      <section class="card card--muted" aria-labelledby="legend-heading">
+        <h2 id="legend-heading" class="card__title">How to read the statuses</h2>
+        <ul class="legend">
+          <li>
+            <span class="badge badge--supported">✓ Supported</span>
+            the retrieved code clearly demonstrates the requirement.
+          </li>
+          <li>
+            <span class="badge badge--partial">◐ Partial</span>
+            the retrieved code demonstrates only part of the requirement.
+          </li>
+          <li>
+            <span class="badge badge--not-found">✕ Not found</span>
+            <strong>not demonstrated in the analyzed repository</strong> — this is not
+            proof that a candidate lacks the skill.
+          </li>
+        </ul>
+        <p class="card__hint">
+          The browser never decides these statuses. They are shown exactly as the backend
+          assessment returned them.
+        </p>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="wrap">
+        <p>W-PS-2 AI Career Coach — hackathon MVP.</p>
+      </div>
+    </footer>
+
+    <!-- Config must load before the module so the API base URL is available. -->
+    <script src="config.js"></script>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
