@@ -212,6 +212,7 @@ export class EvidenceService {
         matchThreshold: similarityThreshold,
         matchCount,
         repositoryId: repo.id,
+        embeddingModel: this.embeddingService.model,
       });
 
       const matches = (rawChunks || []).map((chunk) => {
@@ -220,7 +221,7 @@ export class EvidenceService {
         const commitSha = chunk.commit_sha || targetCommitSha;
 
         return {
-          chunkId: chunk.id,
+          chunkId: chunk.id ?? chunk.chunk_id,
           similarity: typeof chunk.similarity === "number" ? Number(chunk.similarity.toFixed(4)) : chunk.similarity,
           repositoryName: repo.full_name || `${repo.owner}/${repo.name}`,
           filePath: chunk.file_path,

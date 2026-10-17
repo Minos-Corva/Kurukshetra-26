@@ -14,15 +14,16 @@ A missing signal means **“not demonstrated in the analyzed repository”**, no
 
 ## Repository starting state
 
-- Git is initialized; the default branch is `master` and has no commits yet.
+- Git is initialized. The default branch is `main`; feature work happens on branches (for example `feature-evidance-retrival`).
 - Top-level directories: `backend/` and `frontend/`.
 - `frontend/` is currently empty. No frontend framework or tooling has been selected; do not assume one.
 - The backend is a Node.js package using ES modules (`"type": "module"`).
-- Backend entry point: `backend/src/index.js` — Express server with `/api/job-postings` route, Supabase client, and Groq client wired up.
+- Backend entry point: `backend/src/index.js` — Express server with `/api/job-postings`, `/api/repositories/ingest`, and `/api/evidence/retrieve` routes, Supabase client, Groq client, and Octokit wired up.
 - Backend layer directories now contain:
   - Feature 3: `backend/src/controllers/jobPostingsController.js`, `backend/src/repositories/jobPostingsRepository.js`, `backend/src/services/requirementExtractionService.js`, `backend/src/routes/jobPostingsRoutes.js`
   - Feature 4 & 5 (chunking + embedding pipeline): `backend/src/controllers/repositoriesController.js`, `backend/src/repositories/repositoriesRepository.js`, `backend/src/routes/repositoriesRoutes.js`, `backend/src/services/githubIngestionService.js`, `backend/src/services/chunkingService.js`, `backend/src/services/embeddingService.js`
-  - Test files: `backend/src/jobPostings.test.js`, `backend/src/repositories.test.js`, `backend/src/chunking-embedding.test.js` (Feature 5 focused checks, 17 tests)
+  - Feature 6 (evidence retrieval): `backend/src/controllers/evidenceController.js`, `backend/src/repositories/evidenceRepository.js`, `backend/src/services/evidenceService.js`, `backend/src/routes/evidenceRoutes.js`
+  - Test files: `backend/src/jobPostings.test.js`, `backend/src/repositories.test.js`, `backend/src/chunking-embedding.test.js` (Feature 5 focused checks, 17 tests), `backend/src/evidence.test.js` (Feature 6, 14 tests)
   - Smoke test: `backend/src/smoke-test-ingest.js` (run with `npm run smoke-test [owner] [repo]`)
 
 - Installed backend dependencies: `express`, `@supabase/supabase-js`, `zod`, `dotenv`, `octokit`, `@huggingface/transformers`, and `groq-sdk`. Groq is wired up in `index.js` (exported as `groq`) for requirement extraction.
@@ -33,7 +34,7 @@ A missing signal means **“not demonstrated in the analyzed repository”**, no
 
 ## Supabase schema (remote project)
 
-The Supabase database already has 8 tables, all empty (0 rows), all with RLS enabled. This is the source of truth for data records — the "undecided" schema section below is resolved.
+The Supabase database already has 8 tables, all with RLS enabled. (The tables start empty; running the API — ingesting a repository or creating a posting — populates them.) This is the source of truth for data records — the "undecided" schema section below is resolved.
 
 | Table | Purpose |
 |---|---|
@@ -68,13 +69,14 @@ These are the working design decisions discussed so far:
 - Test routes: `GET /` (status), `GET /health` (Supabase reachability), `GET /test/groq` (Groq client configured?), `GET /test/groq/models` (list available Groq models and verify key).
 - API endpoint: `POST /api/job-postings` — accepts `{ sourceUrl, postingText }`, extracts requirements via Groq, validates with Zod, persists to Supabase `job_postings` + `requirements` tables.
 - API endpoint: `POST /api/repositories/ingest` — accepts `{ owner, name, branch? }`, fetches GitHub files, chunks, embeds, and persists to `repositories`, `repository_index_state`, and `code_chunks`. Idempotent on same commit SHA.
+- API endpoint: `POST /api/evidence/retrieve` (alias `POST /api/evidence`) — accepts `{ jobPostingId? , assessmentId?, repositoryId? , owner?, name?, matchCount?, similarityThreshold? }`. Requires either `jobPostingId` or `assessmentId`; repository scope is `repositoryId` or `owner` + `name` (not needed when `assessmentId` is given). Returns per-requirement candidate chunks with `chunkId`, `similarity`, `filePath`, `lineRange`, `content`, and a commit-pinned `sourceUrl`. A requirement with no matches returns an **empty** evidence list — never a claim that the skill is absent. Errors: `400` invalid input, `404` posting/assessment/repository/requirements not found, `422` repository not indexed, `500` embedding/database failure.
 - Required env vars: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (or `SUPABASE_ANON_KEY`), `GROQ_API_KEY`, `GROQ_MODEL`. See `backend/.env.example`. `GITHUB_TOKEN` is optional (increases rate limit from 60 to 5000 req/hr).
 - If adding scripts, define them in `backend/package.json` and run them from `backend/`.
 - Re-run `npm install` after changing `package.json` so `package-lock.json` stays in sync.
 - Do not add a frontend stack until the team chooses one.
 - Keep secrets out of source control and the frontend. Use environment configuration for tokens and service credentials; document required variable names without committing values.
 - The Supabase MCP is read-only. Use normal application credentials and migrations or SQL under an explicitly authorized workflow for writes/schema changes; never assume the MCP can perform them.
-- Tests: `backend/src/jobPostings.test.js` and `backend/src/repositories.test.js` use Node's built-in `node:test` with mocked dependencies. `backend/src/chunking-embedding.test.js` contains focused Feature 5 checks (17 tests). Run all with `npm test` from `backend/`. Total: 32 tests, all passing.
+- Tests: `backend/src/jobPostings.test.js` and `backend/src/repositories.test.js` use Node's built-in `node:test` with mocked dependencies. `backend/src/chunking-embedding.test.js` contains focused Feature 5 checks (17 tests). `backend/src/evidence.test.js` contains Feature 6 checks (14 tests, mocked Supabase/embeddings). Run all with `npm test` from `backend/`. Total: 46 tests, all passing.
 
 ## Embedding model
 
@@ -97,9 +99,36 @@ Line-based, deterministic, implemented in `backend/src/services/chunkingService.
 - Same file + same commit SHA always produces the same chunk sequence (deterministic).
 - Excluded from indexing: binary files, lockfiles, minified bundles, `node_modules/`, `dist/`, `build/`, and other generated directories (see `githubIngestionService.js` for the full exclusion lists).
 
+## Vector search RPC (evidence retrieval)
+
+The evidence endpoint queries code chunks through a Supabase Postgres function. The **deployed signature is the source of truth**:
+
+```sql
+match_code_chunks(
+  p_repository_id   uuid,
+  p_embedding_model text,
+  p_query_embedding vector,
+  p_match_count     integer DEFAULT 10
+) RETURNS TABLE(
+  chunk_id uuid, file_path text, start_line integer,
+  end_line integer, commit_sha text, content text, similarity real
+)
+```
+
+- It filters by `repository_id`, `embedding_model`, and `embedding_dimensions = vector_dims(p_query_embedding)`, orders by cosine distance, and caps results at 50.
+- It has **no similarity-threshold argument** — `similarityThreshold` is applied client-side in `evidenceRepository.matchCodeChunks`.
+- The returned key is **`chunk_id`** (not `id`); the repository normalizes it to `id` before mapping to the API response.
+- `evidenceRepository.matchCodeChunks` calls the deployed signature first (passing the model name from `EmbeddingService.model`) and falls back to older parameter shapes (`filter_repository_id` / `repository_id` / 3-arg) if the function is missing.
+- There are **no SQL migration files in the repo**; the function lives only in the remote database. If the signature changes, update `evidenceRepository.js` and `evidence.test.js` to match.
+
 ## LLM model
 
 Chosen: **Groq** with **`qwen/qwen3.8-27b`** (configured via `GROQ_MODEL` env var). Confirmed supported for this account via `GET /test/groq/models`. Record `model_name` per assessment in `assessments` table. To change models, update `GROQ_MODEL` in `.env` and restart the server.
+
+## Implementation status
+
+- **Implemented and verified live:** requirement extraction (`POST /api/job-postings` → Groq), repository ingestion/chunking/embedding (`POST /api/repositories/ingest`), evidence retrieval with citations (`POST /api/evidence/retrieve`), and the change-detection *data model* in `repository_index_state` (re-ingesting the same commit SHA is a no-op; chunks are replaced when the SHA changes).
+- **Not implemented yet:** the poller that watches for new commits, and the assessment/reassessment step. The `assessments`, `requirement_assessments`, and `assessment_evidence` tables exist but nothing writes them, and there is no assessment endpoint.
 
 ## Still to decide
 

@@ -15,7 +15,7 @@
  *  - Missing entity handling (job posting, assessment, repository, requirements)
  *  - Zod request validation
  *  - Safe error responses for database and embedding failures
- *  - RPC parameter fallback compatibility (filter_repository_id vs repository_id)
+ *  - RPC parameter fallback compatibility (deployed p_* signature vs legacy signatures)
  *
  * Run with: npm test
  */
@@ -57,6 +57,7 @@ function makeMockResponse() {
 
 function makeMockEmbeddingService({ shouldFail = false } = {}) {
   return {
+    model: "jinaai/jina-embeddings-v2-base-code",
     embedTexts: async (texts) => {
       if (shouldFail) {
         throw new Error("Embedding model execution failed");
@@ -148,11 +149,14 @@ function makeMockSupabase({
       if (rpcHandler) {
         return rpcHandler(fnName, params);
       }
-      // Default match_code_chunks mock: returns chunks for matching repository with similarity
-      const targetRepoId = params.filter_repository_id || params.repository_id;
+      // Default match_code_chunks mock: returns chunks for matching repository with similarity.
+      // Supports the deployed 4-arg signature (p_*) and the legacy signature.
+      const targetRepoId =
+        params.p_repository_id || params.filter_repository_id || params.repository_id;
+      const requestedCount = params.p_match_count || params.match_count || 5;
       const matched = store.code_chunks
         .filter((c) => !targetRepoId || c.repository_id === targetRepoId)
-        .slice(0, params.match_count || 5)
+        .slice(0, requestedCount)
         .map((c, idx) => ({
           ...c,
           similarity: 0.9 - idx * 0.05,
@@ -414,7 +418,7 @@ test("Requirement 4: GitHub source URL helper formats single line, multi-line, a
   assert.ok(queryText.includes("Hints: useState, useEffect"));
 });
 
-test("Requirement 5: Configurable matchCount and similarityThreshold parameters are forwarded", async () => {
+test("Requirement 5: matchCount is forwarded to the RPC and similarityThreshold filters the returned matches", async () => {
   let capturedParams = null;
   const supabase = makeMockSupabase({
     postings: [SAMPLE_POSTING],
@@ -424,7 +428,14 @@ test("Requirement 5: Configurable matchCount and similarityThreshold parameters 
     codeChunks: SAMPLE_CHUNKS,
     rpcHandler: (fnName, params) => {
       capturedParams = params;
-      return { data: [], error: null };
+      // Two matches: one above the 0.85 threshold, one below it.
+      return {
+        data: [
+          { ...SAMPLE_CHUNKS[0], similarity: 0.9 },
+          { ...SAMPLE_CHUNKS[1], similarity: 0.6 },
+        ],
+        error: null,
+      };
     },
   });
 
@@ -446,8 +457,16 @@ test("Requirement 5: Configurable matchCount and similarityThreshold parameters 
   await controller.retrieve(req, res);
 
   assert.strictEqual(res.getStatusCode(), 200);
-  assert.strictEqual(capturedParams.match_count, 7);
-  assert.strictEqual(capturedParams.match_threshold, 0.85);
+
+  // Deployed signature: p_match_count / p_repository_id / p_embedding_model
+  assert.strictEqual(capturedParams.p_match_count, 7);
+  assert.strictEqual(capturedParams.p_repository_id, SAMPLE_REPO.id);
+  assert.strictEqual(capturedParams.p_embedding_model, embeddingService.model);
+
+  // Threshold is applied client-side (deployed RPC has no threshold argument)
+  const matches = res.getBody().evidence[0].evidence;
+  assert.strictEqual(matches.length, 1);
+  assert.ok(matches[0].similarity >= 0.85);
 });
 
 test("Requirement 6: Requirement with no matching code returns empty evidence list without claiming skill is absent", async () => {
@@ -504,7 +523,9 @@ test("Requirement 7: Search is scoped to the target repository and avoids return
     codeChunks: [SAMPLE_CHUNKS[0], otherRepoChunk],
     // RPC improperly returns both, repository should filter out other repository's chunk
     rpcHandler: (_fn, params) => {
-      const repoId = params.filter_repository_id || params.repository_id;
+      const repoId =
+        params.p_repository_id || params.filter_repository_id || params.repository_id;
+      void repoId;
       return {
         data: [
           { ...SAMPLE_CHUNKS[0], similarity: 0.9 },
@@ -732,29 +753,78 @@ test("Requirement 13: Database failure returns 500 without leaking database cred
   assert.strictEqual(res.getBody().error, "Database error");
 });
 
-test("Requirement 14: RPC parameter fallback compatibility (filter_repository_id vs repository_id)", async () => {
-  let calls = [];
-  const customSupabase = {
-    rpc: async (fnName, params) => {
+test("Requirement 14: Uses the deployed match_code_chunks signature, normalizes chunk_id, and falls back to legacy signatures", async () => {
+  // Part A: deployed 4-arg signature is used and chunk_id is normalized to id.
+  const calls = [];
+  const deployedSupabase = {
+    rpc: async (_fn, params) => {
       calls.push(params);
+      return {
+        data: [
+          {
+            chunk_id: "deployed-chunk-1",
+            file_path: "src/app.js",
+            start_line: 5,
+            end_line: 9,
+            commit_sha: "sha-deployed",
+            content: "const app = express();",
+            similarity: 0.77,
+          },
+        ],
+        error: null,
+      };
+    },
+  };
+
+  const deployedRepo = new EvidenceRepository({ supabaseClient: deployedSupabase });
+  const deployedResults = await deployedRepo.matchCodeChunks({
+    queryEmbedding: new Array(768).fill(0.1),
+    matchThreshold: 0.5,
+    matchCount: 5,
+    repositoryId: SAMPLE_REPO.id,
+    embeddingModel: "jinaai/jina-embeddings-v2-base-code",
+  });
+
+  assert.strictEqual(deployedResults.length, 1);
+  assert.strictEqual(deployedResults[0].id, "deployed-chunk-1");
+  assert.strictEqual(deployedResults[0].chunk_id, "deployed-chunk-1");
+  assert.strictEqual(calls.length, 1);
+  assert.ok("p_query_embedding" in calls[0]);
+  assert.strictEqual(calls[0].p_repository_id, SAMPLE_REPO.id);
+  assert.strictEqual(calls[0].p_embedding_model, "jinaai/jina-embeddings-v2-base-code");
+  assert.strictEqual(calls[0].p_match_count, 5);
+
+  // Part B: if the deployed function is unavailable, legacy signatures are tried in order.
+  const fallbackCalls = [];
+  const legacySupabase = {
+    rpc: async (_fn, params) => {
+      fallbackCalls.push(params);
+      if ("p_query_embedding" in params) {
+        const err = new Error(
+          "Could not find the function public.match_code_chunks(p_repository_id, p_embedding_model, p_query_embedding, p_match_count) in the schema cache"
+        );
+        err.code = "PGRST202";
+        return { data: null, error: err };
+      }
       if ("filter_repository_id" in params) {
-        // Simulate remote function that expects repository_id instead of filter_repository_id
         return { data: null, error: new Error("parameter filter_repository_id does not exist") };
       }
       return { data: [{ ...SAMPLE_CHUNKS[0], similarity: 0.88 }], error: null };
     },
   };
 
-  const repo = new EvidenceRepository({ supabaseClient: customSupabase });
-  const results = await repo.matchCodeChunks({
+  const legacyRepo = new EvidenceRepository({ supabaseClient: legacySupabase });
+  const legacyResults = await legacyRepo.matchCodeChunks({
     queryEmbedding: new Array(768).fill(0.1),
     matchThreshold: 0.5,
     matchCount: 5,
     repositoryId: SAMPLE_REPO.id,
+    embeddingModel: "jinaai/jina-embeddings-v2-base-code",
   });
 
-  assert.strictEqual(results.length, 1);
-  assert.strictEqual(calls.length, 2);
-  assert.ok("filter_repository_id" in calls[0]);
-  assert.ok("repository_id" in calls[1]);
+  assert.strictEqual(legacyResults.length, 1);
+  assert.strictEqual(fallbackCalls.length, 3);
+  assert.ok("p_query_embedding" in fallbackCalls[0]);
+  assert.ok("filter_repository_id" in fallbackCalls[1]);
+  assert.ok("repository_id" in fallbackCalls[2]);
 });

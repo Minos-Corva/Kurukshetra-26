@@ -159,79 +159,127 @@ export class EvidenceRepository {
   /**
    * Execute vector similarity search via Supabase match_code_chunks RPC.
    *
-   * Tries compatible parameter signatures:
-   * 1. { query_embedding, match_threshold, match_count, filter_repository_id }
-   * 2. { query_embedding, match_threshold, match_count, repository_id }
-   * 3. { query_embedding, match_threshold, match_count } + client-side scoping
+   * The deployed function signature (source of truth) is:
+   *   match_code_chunks(
+   *     p_repository_id   uuid,
+   *     p_embedding_model text,
+   *     p_query_embedding vector,
+   *     p_match_count     integer DEFAULT 10
+   *   )
+   * and it returns: chunk_id, file_path, start_line, end_line, commit_sha, content, similarity.
+   *
+   * Callers that pass `embeddingModel` (and a `repositoryId`) use that deployed signature
+   * first. Older/simpler signatures are attempted as a fallback so the repository keeps
+   * working against alternate database deployments.
+   *
+   * Because the deployed function has no threshold argument, `matchThreshold` is applied
+   * client-side to the returned matches so the documented API behaviour is honoured.
    *
    * @param {object} params
    * @param {number[]} params.queryEmbedding 768-dimensional normalized embedding
-   * @param {number} [params.matchThreshold=0.0]
+   * @param {number} [params.matchThreshold=0.0] Minimum similarity (0–1) to keep a match
    * @param {number} [params.matchCount=5]
    * @param {string} [params.repositoryId]
+   * @param {string} [params.embeddingModel] Model name stored alongside indexed chunks
    * @returns {Promise<Array<object>>}
    */
-  async matchCodeChunks({ queryEmbedding, matchThreshold = 0.0, matchCount = 5, repositoryId = null }) {
+  async matchCodeChunks({
+    queryEmbedding,
+    matchThreshold = 0.0,
+    matchCount = 5,
+    repositoryId = null,
+    embeddingModel = null,
+  } = {}) {
     if (!Array.isArray(queryEmbedding) || queryEmbedding.length === 0) {
       throw new Error("queryEmbedding must be a non-empty array");
     }
 
-    // Try signature 1: filter_repository_id
-    const params1 = {
+    // Candidate parameter sets, most-preferred first.
+    const candidates = [];
+
+    // 1. Deployed signature (requires the embedding model name used at index time).
+    if (repositoryId && embeddingModel) {
+      candidates.push({
+        p_repository_id: repositoryId,
+        p_embedding_model: embeddingModel,
+        p_query_embedding: queryEmbedding,
+        p_match_count: matchCount,
+      });
+    }
+
+    // 2. Legacy signatures (no embedding-model filter).
+    const legacy = {
       query_embedding: queryEmbedding,
       match_threshold: matchThreshold,
       match_count: matchCount,
     };
     if (repositoryId) {
-      params1.filter_repository_id = repositoryId;
+      candidates.push({ ...legacy, filter_repository_id: repositoryId });
+      candidates.push({ ...legacy, repository_id: repositoryId });
     }
+    candidates.push(legacy);
 
-    let { data, error } = await this.supabase.rpc("match_code_chunks", params1);
+    let data = null;
+    let lastError = null;
 
-    // If signature 1 failed because parameter was not found or function mismatch, try signature 2: repository_id
-    if (error && (error.message?.includes("filter_repository_id") || error.code === "PGRST202")) {
-      const params2 = {
-        query_embedding: queryEmbedding,
-        match_threshold: matchThreshold,
-        match_count: matchCount,
-      };
-      if (repositoryId) {
-        params2.repository_id = repositoryId;
+    for (const params of candidates) {
+      const res = await this.supabase.rpc("match_code_chunks", params);
+      if (!res.error) {
+        data = res.data;
+        lastError = null;
+        break;
       }
-      const res2 = await this.supabase.rpc("match_code_chunks", params2);
-      if (!res2.error) {
-        data = res2.data;
-        error = null;
-      } else if (res2.error && (res2.error.message?.includes("repository_id") || res2.error.code === "PGRST202")) {
-        // Try signature 3: 3-param match_code_chunks without repository param, filter in client
-        const res3 = await this.supabase.rpc("match_code_chunks", {
-          query_embedding: queryEmbedding,
-          match_threshold: matchThreshold,
-          match_count: repositoryId ? matchCount * 3 : matchCount,
-        });
-        if (!res3.error) {
-          data = (res3.data || [])
-            .filter((chunk) => !repositoryId || chunk.repository_id === repositoryId)
-            .slice(0, matchCount);
-          error = null;
-        } else {
-          error = res3.error;
-        }
-      } else {
-        error = res2.error;
+      lastError = res.error;
+      // Only keep trying alternate signatures when the function/arguments did not match.
+      if (!isSignatureMismatch(res.error)) {
+        break;
       }
     }
 
-    if (error) {
-      throw new Error(`Vector search failed via match_code_chunks RPC: ${error.message}`);
+    if (lastError) {
+      throw new Error(`Vector search failed via match_code_chunks RPC: ${lastError.message}`);
     }
 
-    return (data || []).filter((chunk) => {
+    const rows = (data || []).filter((chunk) => {
       // Defensive check: ensure no unrelated repository chunks slip through
       if (repositoryId && chunk.repository_id && chunk.repository_id !== repositoryId) {
         return false;
       }
       return true;
     });
+
+    // Normalize the deployed RPC output: it returns `chunk_id`, while callers expect `id`.
+    const normalized = rows.map((chunk) => {
+      const similarity =
+        typeof chunk.similarity === "number" ? chunk.similarity : Number(chunk.similarity);
+      return {
+        ...chunk,
+        id: chunk.id ?? chunk.chunk_id,
+        similarity,
+      };
+    });
+
+    // Apply the similarity threshold client-side (deployed RPC has no threshold argument).
+    if (typeof matchThreshold === "number" && matchThreshold > 0) {
+      return normalized.filter(
+        (chunk) => typeof chunk.similarity !== "number" || Number.isNaN(chunk.similarity) || chunk.similarity >= matchThreshold
+      );
+    }
+
+    return normalized;
   }
+}
+
+/**
+ * Detect a PostgREST signature/argument mismatch, which means we should try
+ * another parameter shape rather than surfacing the error.
+ *
+ * @param {object} error
+ * @returns {boolean}
+ */
+function isSignatureMismatch(error) {
+  if (!error) return false;
+  if (error.code === "PGRST202") return true;
+  const message = error.message || "";
+  return /could not find the function|does not exist|schema cache/i.test(message);
 }
