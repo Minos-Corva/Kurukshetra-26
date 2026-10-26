@@ -32,6 +32,19 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
+// Allow the separately hosted Vercel frontend to call this API. Set
+// FRONTEND_ORIGIN to the exact deployed frontend origin (scheme + hostname).
+if (process.env.FRONTEND_ORIGIN) {
+  app.use((req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", process.env.FRONTEND_ORIGIN);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type,x-polling-secret");
+    if (req.method === "OPTIONS") return res.sendStatus(204);
+    next();
+  });
+}
+
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
 const groqApiKey = process.env.GROQ_API_KEY;
@@ -101,17 +114,22 @@ const assessmentService = new AssessmentService({
 });
 const assessmentsController = new AssessmentsController({ assessmentService });
 
-const pollIntervalSeconds = Number(process.env.POLL_INTERVAL_SECONDS) || 60;
+const pollIntervalSeconds = Number(process.env.POLL_INTERVAL_SECONDS) || 300;
 export const pollingService = new PollingService({
   githubService,
   chunkingService,
   embeddingService,
   repository: repositoriesRepo,
+  assessmentRepository: assessmentRepo,
+  assessmentService,
   pollingIntervalMs: pollIntervalSeconds * 1000,
 });
 
-if (process.env.ENABLE_POLLING === "true") {
+if (process.env.ENABLE_POLLING !== "false") {
   pollingService.start();
+  pollingService.pollAll().catch((err) => {
+    console.error(`[Polling] Startup polling cycle failed: ${err.message}`);
+  });
 }
 
 app.use("/api", createJobPostingsRoutes({ controller }));

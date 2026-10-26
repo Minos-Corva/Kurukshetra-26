@@ -78,6 +78,19 @@ export class AssessmentRepository {
     return data;
   }
 
+  /** List distinct posting/repository pairs that have been assessed for a repository. */
+  async listAssessmentTargetsByRepository(repositoryId) {
+    const { data, error } = await this.supabase
+      .from("assessments")
+      .select("job_posting_id, repository_id")
+      .eq("repository_id", repositoryId);
+
+    if (error) throw new Error(`Failed to list repository assessment targets: ${error.message}`);
+    const unique = new Map();
+    for (const row of data || []) unique.set(row.job_posting_id, row);
+    return [...unique.values()];
+  }
+
   /**
    * Insert a new assessment row.
    */

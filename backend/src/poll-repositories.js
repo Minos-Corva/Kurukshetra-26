@@ -11,10 +11,15 @@
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import { Octokit } from "octokit";
+import { Groq } from "groq-sdk";
 import { RepositoriesRepository } from "./repositories/repositoriesRepository.js";
+import { AssessmentRepository } from "./repositories/assessmentRepository.js";
+import { EvidenceRepository } from "./repositories/evidenceRepository.js";
 import { GithubIngestionService } from "./services/githubIngestionService.js";
 import { ChunkingService } from "./services/chunkingService.js";
 import { EmbeddingService } from "./services/embeddingService.js";
+import { EvidenceService } from "./services/evidenceService.js";
+import { AssessmentService } from "./services/assessmentService.js";
 import { PollingService } from "./services/pollingService.js";
 
 dotenv.config();
@@ -28,6 +33,11 @@ if (!supabaseUrl || !supabaseKey) {
 }
 
 const supabase = createClient(supabaseUrl, supabaseKey);
+if (!process.env.GROQ_API_KEY || !process.env.GROQ_MODEL) {
+  console.error("Missing GROQ_API_KEY or GROQ_MODEL; polling reassessment requires both.");
+  process.exit(1);
+}
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const octokit = new Octokit({
   auth: process.env.GITHUB_TOKEN || undefined,
   retry: { enabled: false },
@@ -42,6 +52,17 @@ const repository = new RepositoriesRepository({ supabaseClient: supabase });
 const githubService = new GithubIngestionService({ octokit });
 const chunkingService = new ChunkingService();
 const embeddingService = new EmbeddingService();
+const assessmentRepository = new AssessmentRepository({ supabaseClient: supabase });
+const evidenceService = new EvidenceService({
+  embeddingService,
+  repository: new EvidenceRepository({ supabaseClient: supabase }),
+});
+const assessmentService = new AssessmentService({
+  evidenceService,
+  groqClient: groq,
+  model: process.env.GROQ_MODEL,
+  repository: assessmentRepository,
+});
 
 const pollIntervalSeconds = Number(process.env.POLL_INTERVAL_SECONDS) || 60;
 const pollingIntervalMs = pollIntervalSeconds * 1000;
@@ -51,6 +72,8 @@ const pollingService = new PollingService({
   chunkingService,
   embeddingService,
   repository,
+  assessmentRepository,
+  assessmentService,
   pollingIntervalMs,
   logger: console,
 });
@@ -99,6 +122,9 @@ async function main() {
       console.log(`  - ${name}: skipped (${res.reason})`);
     } else {
       console.log(`  ✗ ${name}: failed (${res.error})`);
+    }
+    for (const assessment of res.assessments || []) {
+      console.log(`      assessment ${assessment.status}: posting ${assessment.jobPostingId || "unknown"}${assessment.assessmentId ? ` → ${assessment.assessmentId}` : ""}${assessment.error ? ` (${assessment.error})` : ""}`);
     }
   }
 

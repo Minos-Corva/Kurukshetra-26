@@ -19,7 +19,7 @@
 
 import { isEligibleFile } from "./githubIngestionService.js";
 
-const DEFAULT_POLLING_INTERVAL_MS = 60 * 1000; // 60 seconds
+const DEFAULT_POLLING_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const STALE_RUNNING_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
 
 export class PollingService {
@@ -37,6 +37,8 @@ export class PollingService {
     chunkingService,
     embeddingService,
     repository,
+    assessmentRepository,
+    assessmentService,
     pollingIntervalMs = DEFAULT_POLLING_INTERVAL_MS,
     logger = console,
   } = {}) {
@@ -49,12 +51,41 @@ export class PollingService {
     this.chunkingService = chunkingService;
     this.embeddingService = embeddingService;
     this.repository = repository;
+    this.assessmentRepository = assessmentRepository;
+    this.assessmentService = assessmentService;
     this.pollingIntervalMs = pollingIntervalMs;
     this.logger = logger;
 
     this.activeRepoRuns = new Set();
     this.isPollingAll = false;
     this.timer = null;
+  }
+
+  async reassessRepository(repositoryId) {
+    if (!this.assessmentRepository || !this.assessmentService) return [];
+    let targets;
+    try {
+      targets = await this.assessmentRepository.listAssessmentTargetsByRepository(repositoryId);
+    } catch (error) {
+      const message = (error.message || "Could not find saved assessments").slice(0, 255);
+      this.logger.error(`[Polling] Could not load reassessment targets: ${message}`);
+      return [{ status: "failed", error: message }];
+    }
+    const results = [];
+    for (const target of targets) {
+      try {
+        const result = await this.assessmentService.assess({
+          jobPostingId: target.job_posting_id,
+          repositoryId: target.repository_id,
+        });
+        results.push({ jobPostingId: target.job_posting_id, assessmentId: result.assessment.id, status: "updated" });
+        this.logger.log(`[Polling] Reassessed posting ${target.job_posting_id} at ${result.assessment.commitSha?.slice(0, 7)} (assessment ${result.assessment.id})`);
+      } catch (error) {
+        results.push({ jobPostingId: target.job_posting_id, status: "failed", error: (error.message || "Assessment failed").slice(0, 255) });
+        this.logger.error(`[Polling] Reassessment failed for posting ${target.job_posting_id}: ${(error.message || "Assessment failed").slice(0, 255)}`);
+      }
+    }
+    return results;
   }
 
   /**
@@ -139,12 +170,13 @@ export class PollingService {
         this.logger.log(
           `[Polling] ${repoFullName}: up to date at commit ${latestCommitSha.slice(0, 7)}`
         );
-        return {
+        const result = {
           repositoryId: repoId,
           repositoryName: repoFullName,
           status: "unchanged",
           commitSha: latestCommitSha,
         };
+        return result;
       }
 
       // 6. Handle case where repository was never indexed before (no prior commit SHA)
@@ -182,6 +214,8 @@ export class PollingService {
           fileCount: ingestResult.files.length,
           chunkCount: embeddedChunks.length,
         };
+        result.assessments = await this.reassessRepository(repoId);
+        return result;
       }
 
       // 7. Branch has advanced: perform incremental update
@@ -220,7 +254,7 @@ export class PollingService {
             commitSha: fullIngest.commitSha,
             embeddedChunks,
           });
-          return {
+          const result = {
             repositoryId: repoId,
             repositoryName: repoFullName,
             status: "reindexed_full",
@@ -229,6 +263,8 @@ export class PollingService {
             fileCount: fullIngest.files.length,
             chunkCount: embeddedChunks.length,
           };
+          result.assessments = await this.reassessRepository(repoId);
+          return result;
         }
         throw compErr;
       }
@@ -244,7 +280,7 @@ export class PollingService {
         this.logger.log(
           `[Polling] ${repoFullName}: no file differences in commit range; advanced index to ${latestCommitSha.slice(0, 7)}`
         );
-        return {
+        const result = {
           repositoryId: repoId,
           repositoryName: repoFullName,
           status: "updated",
@@ -261,6 +297,8 @@ export class PollingService {
             chunksInserted: 0,
           },
         };
+        result.assessments = await this.reassessRepository(repoId);
+        return result;
       }
 
       // Categorize changed files
@@ -387,7 +425,7 @@ export class PollingService {
         `[Polling] ${repoFullName}: successfully updated ${oldCommitSha.slice(0, 7)} -> ${latestCommitSha.slice(0, 7)} (+${stats.added}, ~${stats.modified}, -${stats.deleted}, ->${stats.renamed}, ${stats.skipped} skipped, ${stats.oversized} oversized; ${embeddedChunks.length} chunks added, ${deletedChunksCount} chunks deleted)`
       );
 
-      return {
+      const result = {
         repositoryId: repoId,
         repositoryName: repoFullName,
         status: "updated",
@@ -400,6 +438,8 @@ export class PollingService {
         },
         skippedFiles,
       };
+      result.assessments = await this.reassessRepository(repoId);
+      return result;
     } catch (err) {
       const rawMessage = err.message || "Unknown polling failure";
       const safeReason = rawMessage.slice(0, 255);
